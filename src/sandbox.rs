@@ -59,3 +59,57 @@ impl Sandbox {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, PermissionsConfig};
+
+    fn sandbox_with_permissions(bash: &str, write: &str, read: &str) -> Sandbox {
+        let mut cfg = Config::default();
+        cfg.permissions = PermissionsConfig {
+            bash: bash.to_string(),
+            write: write.to_string(),
+            read: read.to_string(),
+            ..PermissionsConfig::default()
+        };
+        Sandbox::from_config(&cfg)
+    }
+
+    #[test]
+    fn test_check_allow() {
+        let s = sandbox_with_permissions("allow", "allow", "allow");
+        assert!(matches!(s.check("bash"), PermissionLevel::Allow));
+    }
+
+    #[test]
+    fn test_check_deny() {
+        let s = sandbox_with_permissions("deny", "deny", "deny");
+        assert!(matches!(s.check("bash"), PermissionLevel::Deny));
+    }
+
+    #[test]
+    fn test_check_ask() {
+        let s = sandbox_with_permissions("ask", "ask", "ask");
+        assert!(matches!(s.check("bash"), PermissionLevel::Ask));
+    }
+
+    #[test]
+    fn test_check_auto_approve() {
+        let mut s = sandbox_with_permissions("ask", "ask", "ask");
+        s.set_auto_approve(true);
+        assert!(matches!(s.check("bash"), PermissionLevel::Allow));
+    }
+
+    #[test]
+    fn test_check_question_always_allowed() {
+        let s = sandbox_with_permissions("deny", "deny", "deny");
+        assert!(matches!(s.check("question"), PermissionLevel::Allow));
+    }
+
+    #[test]
+    fn test_check_default_is_ask() {
+        let s = sandbox_with_permissions("unknown_value", "unknown_value", "unknown_value");
+        assert!(matches!(s.check("bash"), PermissionLevel::Ask));
+    }
+}

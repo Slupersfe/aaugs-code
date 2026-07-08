@@ -87,3 +87,65 @@ impl Message {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_system() {
+        let m = Message::system("prompt");
+        assert_eq!(m.role, Role::System);
+        assert_eq!(m.text_content(), Some("prompt"));
+    }
+
+    #[test]
+    fn test_message_user() {
+        let m = Message::user("hello");
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.text_content(), Some("hello"));
+    }
+
+    #[test]
+    fn test_message_assistant() {
+        let m = Message::assistant(vec![ContentBlock::Text { text: "hi".into() }]);
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.text_content(), Some("hi"));
+    }
+
+    #[test]
+    fn test_message_tool_result() {
+        let m = Message::tool_result("call_1", "output");
+        assert_eq!(m.role, Role::Tool);
+        assert!(m.text_content().is_none()); // ToolResult is not a Text block
+    }
+
+    #[test]
+    fn test_serialize_roundtrip() {
+        let m = Message::user("hello");
+        let json = serde_json::to_string(&m).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.text_content(), Some("hello"));
+    }
+
+    #[test]
+    fn test_content_block_tool_use_serialize() {
+        let input = serde_json::json!({"path": "/tmp"});
+        let block = ContentBlock::ToolUse {
+            id: "tu_1".into(),
+            name: "read".into(),
+            input: input.clone(),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("tool_use"));
+        assert!(json.contains("read"));
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentBlock::ToolUse { name, input: inp, .. } => {
+                assert_eq!(name, "read");
+                assert_eq!(inp, input);
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+}

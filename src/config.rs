@@ -210,3 +210,67 @@ impl Config {
         &self.advanced.api_format
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config() -> Config {
+        Config {
+            provider: "openai".to_string(),
+            openai: Some(ProviderConfig {
+                api_key: "sk-test".to_string(),
+                model: "gpt-4o".to_string(),
+                base_url: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_valid() {
+        let cfg = make_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_api_format() {
+        let mut cfg = make_config();
+        cfg.advanced.api_format = "bad-format".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_missing_provider_config() {
+        let mut cfg = make_config();
+        cfg.openai = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_provider_config_returns_some() {
+        let cfg = make_config();
+        assert!(cfg.provider_config().is_some());
+    }
+
+    #[test]
+    fn test_provider_config_returns_none_for_unknown() {
+        let mut cfg = make_config();
+        cfg.provider = "nonexistent".to_string();
+        assert!(cfg.provider_config().is_none());
+    }
+
+    #[test]
+    fn test_resolved_api_format_default() {
+        let cfg = make_config();
+        assert_eq!(cfg.resolved_api_format(), "auto");
+    }
+
+    #[test]
+    fn test_default_path_returns_result() {
+        let path = Config::default_path();
+        assert!(path.is_ok());
+        let p = path.unwrap();
+        assert!(p.ends_with("vibe/config/vibe.json"));
+    }
+}

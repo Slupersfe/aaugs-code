@@ -46,21 +46,32 @@ pub static MODEL_ITER: LazyLock<Vec<(&'static str, (f64, f64))>> = LazyLock::new
 });
 
 pub fn model_cost(model: &str) -> Pricing {
-    // Try exact match first, then check if any key is a suffix
+    // Try exact match first
     if let Some(&price) = MODEL_PRICES.get(model) {
         return price;
     }
-    // Check prefix matches (e.g. "gpt-4o-..." matches "gpt-4o")
+    // Check prefix/suffix matches — prefer longer (more specific) keys
+    let mut best: Option<(usize, Pricing)> = None;
     for (key, &price) in MODEL_PRICES.iter() {
+        let mut matched = false;
         if model.starts_with(key) || model.ends_with(key) {
-            return price;
+            matched = true;
         }
         // Also check after stripping provider prefix (e.g. "openai/gpt-4o" -> "gpt-4o")
         if let Some(short) = model.split('/').last() {
             if short == *key || short.starts_with(key) {
-                return price;
+                matched = true;
             }
         }
+        if matched {
+            match best {
+                Some((best_len, _)) if key.len() <= best_len => {}
+                _ => best = Some((key.len(), price)),
+            }
+        }
+    }
+    if let Some((_, price)) = best {
+        return price;
     }
     // Default: assume $2/$10 (rough GPT-4o class)
     (2.0, 10.0)
@@ -100,7 +111,7 @@ pub fn favorite_models(provider: &str) -> Vec<&'static str> {
     }
 }
 
-/// Returns all known models whose name contains the given provider prefix.
+/// Returns all known models whose name starts with any of the given provider's prefixes.
 pub fn models_for_provider(provider: &str) -> Vec<&'static str> {
     let prefixes: &[&str] = match provider {
         "openrouter" => &["anthropic/", "openai/", "google/", "deepseek/", "meta-llama/",
@@ -115,4 +126,74 @@ pub fn models_for_provider(provider: &str) -> Vec<&'static str> {
         .filter(|(name, _)| prefixes.iter().any(|p| name.starts_with(p)))
         .map(|(name, _)| *name)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_cost_exact() {
+        let (inp, outp) = model_cost("gpt-4o");
+        assert!((inp - 2.50).abs() < 0.001);
+        assert!((outp - 10.00).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_model_cost_prefix() {
+        let (inp, _outp) = model_cost("gpt-4o-mini-unknown");
+        assert!((inp - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_model_cost_openrouter_strip() {
+        let (inp, _outp) = model_cost("openai/gpt-4o");
+        assert!((inp - 2.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_model_cost_unknown_defaults() {
+        let (inp, _outp) = model_cost("totally-unknown-model-v42");
+        assert!((inp - 2.00).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_cost_zero() {
+        let cost = calculate_cost("gpt-4o", 0, 0);
+        assert!((cost).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_calculate_cost_1m_tokens() {
+        // 1M input + 1M output tokens at gpt-4o prices = $2.50 + $10.00 = $12.50
+        let cost = calculate_cost("gpt-4o", 1_000_000, 1_000_000);
+        assert!((cost - 12.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_favorite_models_openrouter() {
+        let favs = favorite_models("openrouter");
+        assert!(favs.contains(&"anthropic/claude-sonnet-4"));
+        assert!(favs.contains(&"openai/gpt-4o"));
+    }
+
+    #[test]
+    fn test_favorite_models_unknown() {
+        let favs = favorite_models("nonexistent");
+        assert!(favs.is_empty());
+    }
+
+    #[test]
+    fn test_models_for_provider_anthropic() {
+        let models = models_for_provider("anthropic");
+        assert!(models.contains(&"claude-sonnet-4-20250514"));
+        assert!(models.contains(&"claude-opus-4"));
+        assert!(!models.contains(&"gpt-4o"));
+    }
+
+    #[test]
+    fn test_models_for_provider_unknown() {
+        let models = models_for_provider("nope");
+        assert!(models.is_empty());
+    }
 }

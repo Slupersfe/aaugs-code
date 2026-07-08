@@ -788,3 +788,103 @@ pub async fn run_tui_interactive(mut state: ChatState) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimate_tokens_short() {
+        let n = estimate_tokens("hello world");
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty() {
+        let n = estimate_tokens("");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens() {
+        let msg = Message::user("hello");
+        let n = estimate_message_tokens(&msg);
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn test_truncate_messages_under_limit() {
+        let mut msgs = vec![Message::system("sys"), Message::user("hi")];
+        truncate_messages(&mut msgs, 100_000);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_messages_over_limit() {
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("a".repeat(100_000)),
+            Message::user("b".repeat(100_000)),
+            Message::user("c".repeat(100_000)),
+        ];
+        // Set max tokens to roughly 30k chars worth
+        truncate_messages(&mut msgs, 30_000);
+        // Should have kept system + at most 1 user message
+        assert!(msgs.len() < 4, "expected truncation, got {} messages", msgs.len());
+        assert_eq!(msgs[0].role, Role::System);
+    }
+
+    #[test]
+    fn test_auto_title_sets_from_first_user() {
+        let mut session = Session::new("gpt-4o", "openai");
+        let usr = Message::user("fix the database schema");
+        session.messages.push(Message::system("system"));
+        session.messages.push(usr);
+        session.auto_title();
+        assert_eq!(session.title, "fix the database schema");
+    }
+
+    #[test]
+    fn test_auto_title_does_not_overwrite() {
+        let mut session = Session::new("gpt-4o", "openai");
+        session.title = "existing title".to_string();
+        session.messages.push(Message::user("new message"));
+        session.auto_title();
+        assert_eq!(session.title, "existing title");
+    }
+
+    #[test]
+    fn test_auto_title_truncates_long() {
+        let mut session = Session::new("gpt-4o", "openai");
+        let long = "a".repeat(100);
+        session.messages.push(Message::user(long));
+        session.auto_title();
+        // 60 chars + ellipsis
+        assert_eq!(session.title.chars().count(), 61);
+        assert!(session.title.ends_with('…'));
+    }
+
+    #[test]
+    fn test_format_result_short() {
+        let r = ToolResult { success: true, output: "ok".to_string() };
+        let out = format_result(&r);
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn test_format_result_long_truncated() {
+        let long = "x".repeat(3000);
+        let r = ToolResult { success: false, output: long };
+        let out = format_result(&r);
+        assert!(out.starts_with("ERROR (truncated, 3000 bytes total)"));
+        // "ERROR (truncated, 3000 bytes total)\n" + 2000 content chars
+        assert_eq!(out.len(), 36 + 2000);
+    }
+
+    #[test]
+    fn test_format_result_success_prefix() {
+        let r = ToolResult { success: true, output: "x".repeat(2500) };
+        let out = format_result(&r);
+        assert!(out.starts_with("SUCCESS (truncated, 2500 bytes total)"));
+    }
+}
