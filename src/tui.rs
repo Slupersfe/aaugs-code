@@ -1,0 +1,138 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use termimad::MadSkin;
+
+static SKIN: std::sync::LazyLock<MadSkin> = std::sync::LazyLock::new(|| {
+    let mut skin = MadSkin::default();
+    skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);
+    skin.bold.set_fg(termimad::crossterm::style::Color::Yellow);
+    skin.italic.set_fg(termimad::crossterm::style::Color::Magenta);
+    skin.code_block.set_fg(termimad::crossterm::style::Color::Green);
+    skin.code_block.set_bg(termimad::crossterm::style::Color::Reset);
+    skin
+});
+
+pub fn render_markdown(text: &str) {
+    SKIN.print_text(text);
+}
+
+pub fn print_tool_header(name: &str, args: &serde_json::Value) {
+    let pretty = serde_json::to_string_pretty(args).unwrap_or_default();
+    let dim_fg = termimad::crossterm::style::Color::DarkYellow;
+    use termimad::crossterm::style::Stylize;
+    eprintln!("{}", format!("── tool: {} ──", name).with(dim_fg));
+    if !pretty.is_empty() && pretty != "null" {
+        eprintln!("{}", pretty.as_str().with(dim_fg));
+    }
+}
+
+pub fn print_tool_result(output: &str) {
+    if output.is_empty() {
+        return;
+    }
+    let dim_fg = termimad::crossterm::style::Color::DarkGreen;
+    use termimad::crossterm::style::Stylize;
+    let lines: Vec<&str> = output.lines().collect();
+    let display = if lines.len() > 20 {
+        let truncated: Vec<&str> = lines[..20].to_vec();
+        truncated.join("\n") + &format!("\n... ({} more lines)", lines.len() - 20).with(dim_fg).to_string()
+    } else {
+        output.to_string()
+    };
+    eprintln!("{}", display.as_str().with(dim_fg));
+}
+
+pub fn print_tool_denied(name: &str) {
+    let warn_fg = termimad::crossterm::style::Color::Red;
+    use termimad::crossterm::style::Stylize;
+    eprintln!("{}", format!("⛔ tool '{}' denied", name).with(warn_fg));
+}
+
+pub fn print_success() {
+    let dim_fg = termimad::crossterm::style::Color::DarkGreen;
+    use termimad::crossterm::style::Stylize;
+    eprintln!("{}", "── done ──".with(dim_fg));
+}
+
+pub fn print_info(text: &str) {
+    let dim_fg = termimad::crossterm::style::Color::DarkCyan;
+    use termimad::crossterm::style::Stylize;
+    eprintln!("{}", text.with(dim_fg));
+}
+
+pub fn clear_line() {
+    use std::io::Write;
+    use termimad::crossterm::style::Stylize;
+    eprint!("\r{}", " ".repeat(12).as_str().with(termimad::crossterm::style::Color::Reset));
+    let _ = std::io::stderr().flush();
+}
+
+// --- Spinner ---
+
+pub fn start_spinner() -> Arc<AtomicBool> {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut i = 0;
+        while r.load(Ordering::Relaxed) {
+            use std::io::Write;
+            eprint!("\r{} thinking...", frames[i % frames.len()]);
+            let _ = std::io::stderr().flush();
+            thread::sleep(Duration::from_millis(80));
+            i += 1;
+        }
+        // Clear the spinner line
+        use std::io::Write;
+        eprint!("\r                      \r");
+        let _ = std::io::stderr().flush();
+    });
+    running
+}
+
+// --- Streaming output ---
+
+pub struct StreamPrinter {
+    line_count: usize,
+}
+
+impl StreamPrinter {
+    pub fn new() -> Self {
+        Self { line_count: 0 }
+    }
+
+    pub fn write(&mut self, text: &str) {
+        // Count lines printed
+        self.line_count += text.chars().filter(|&c| c == '\n').count();
+        if text.contains('\n') || !self.text_ends_with_newline(text) {
+            // If there's a trailing partial line, we've advanced past it
+        }
+        print!("{}", text);
+    }
+
+    fn text_ends_with_newline(&self, text: &str) -> bool {
+        text.ends_with('\n')
+    }
+
+    pub fn finish(&mut self, rendered_text: &str) {
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        if self.line_count == 0 {
+            // No newlines — go back to start of line, clear it, render markdown
+            print!("\r\x1b[K");
+            std::io::stdout().flush().ok();
+            render_markdown(rendered_text);
+            return;
+        }
+
+        // Move cursor up by line_count, clear from cursor to end of screen, then render markdown
+        print!("\x1b[{}A\x1b[J", self.line_count);
+        std::io::stdout().flush().ok();
+
+        render_markdown(rendered_text);
+    }
+}
