@@ -30,6 +30,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub preferred_models: Vec<String>,
+    #[serde(default)]
     pub base_url: Option<String>,
 }
 
@@ -43,6 +45,10 @@ pub struct AdvancedConfig {
     pub temperature: f32,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: usize,
+    #[serde(default = "default_max_tool_output_storage")]
+    pub max_tool_output_storage: usize,
     pub proxy: Option<String>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderOverride>,
@@ -84,6 +90,14 @@ fn default_timeout() -> u64 {
     120
 }
 
+fn default_max_context_tokens() -> usize {
+    150_000
+}
+
+fn default_max_tool_output_storage() -> usize {
+    4000
+}
+
 fn default_permission() -> String {
     "ask".to_string()
 }
@@ -95,6 +109,8 @@ impl Default for AdvancedConfig {
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout(),
+            max_context_tokens: default_max_context_tokens(),
+            max_tool_output_storage: default_max_tool_output_storage(),
             proxy: None,
             providers: HashMap::new(),
         }
@@ -120,26 +136,31 @@ impl Default for Config {
             openrouter: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "anthropic/claude-sonnet-4".to_string(),
+                preferred_models: Vec::new(),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
             }),
             anthropic: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "claude-sonnet-4-20250514".to_string(),
+                preferred_models: Vec::new(),
                 base_url: None,
             }),
             openai: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "gpt-4o".to_string(),
+                preferred_models: Vec::new(),
                 base_url: Some("https://api.openai.com/v1".to_string()),
             }),
             gemini: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "gemini-2.5-pro".to_string(),
+                preferred_models: Vec::new(),
                 base_url: None,
             }),
             opencode: Some(ProviderConfig {
                 api_key: "public".to_string(),
                 model: "big-pickle".to_string(),
+                preferred_models: Vec::new(),
                 base_url: Some("https://opencode.ai/zen/v1".to_string()),
             }),
             advanced: AdvancedConfig::default(),
@@ -221,6 +242,7 @@ mod tests {
             openai: Some(ProviderConfig {
                 api_key: "sk-test".to_string(),
                 model: "gpt-4o".to_string(),
+                preferred_models: Vec::new(),
                 base_url: None,
             }),
             ..Config::default()

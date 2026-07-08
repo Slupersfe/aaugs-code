@@ -7,14 +7,14 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::cost;
-use crate::llm::{ContentBlock, LLMEvent, Message, Role, Usage};
+use crate::llm::{ContentBlock, LLMEvent, Message, Role, ToolDef, Usage};
 use crate::llm::LLMProvider;
 use crate::sandbox::{PermissionLevel, Sandbox};
 use crate::tools::{ToolRegistry, ToolResult};
 use crate::tui;
 
 const MAX_TURNS: usize = 50;
-const MAX_CONTEXT_TOKENS: usize = 120_000;
+const SUMMARY_PREFIX: &str = "[Summary: ";
 const SESSION_DIR: &str = "vibe/sessions";
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -130,6 +130,184 @@ impl Session {
     }
 }
 
+/// Strips `<think>...</think>` blocks from streaming text chunks.
+/// Tracks whether we're inside an unclosed block via `in_block`.
+/// Handles the common case where `<think>` and `</think>` arrive in separate chunks.
+fn strip_think(chunk: &str, in_block: &mut bool) -> String {
+    let mut out = String::new();
+    let mut rest = chunk;
+
+    loop {
+        if *in_block {
+            match rest.find("</think>") {
+                Some(end) => {
+                    *in_block = false;
+                    rest = &rest[end + 8..];
+                    continue;
+                }
+                None => break,
+            }
+        }
+
+        match rest.find("<think>") {
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let after = &rest[start + 7..];
+                match after.find("</think>") {
+                    Some(end) => {
+                        rest = &after[end + 8..];
+                        continue;
+                    }
+                    None => {
+                        *in_block = true;
+                        break;
+                    }
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+/// Strips any complete `<think>...</think>` blocks from fully assembled text.
+/// Used as a final clean-up pass after all streaming chunks are combined.
+fn strip_think_final(text: String) -> String {
+    let mut result = text;
+    loop {
+        let before = result.len();
+        if let Some(start) = result.find("<think>") {
+            if let Some(end) = result[start..].find("</think>") {
+                let close = start + end + 8;
+                result.replace_range(start..close, "");
+            }
+        }
+        if result.len() == before {
+            break;
+        }
+    }
+    result
+}
+
+/// Collects assistant text content from a message for summarization.
+fn collect_text(message: &Message) -> String {
+    let mut out = String::new();
+    for block in &message.content {
+        if let ContentBlock::Text { text } = block {
+            if !text.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+/// Summarizes old assistant messages into one sentence when context exceeds the limit.
+/// Only summarizes assistant messages (not user). Replaces them with a system summary.
+async fn maybe_summarize(
+    state: &mut ChatState,
+) -> anyhow::Result<()> {
+    let total: usize = state.session.messages.iter().map(estimate_message_tokens).sum();
+    if total <= state.max_context_tokens {
+        return Ok(());
+    }
+
+    // Find the range of assistant/tool messages to summarize.
+    // Keep the last few user messages and everything after them.
+    let cutoff = find_summarize_cutoff(&state.session.messages);
+    if cutoff == 0 {
+        return Ok(()); // Nothing to summarize
+    }
+
+    let to_summarize: Vec<Message> = state.session.messages.drain(..=cutoff).collect();
+
+    // Extract text from assistant messages in the range
+    let mut conversation_text = String::new();
+    for msg in &to_summarize {
+        if msg.role == Role::Assistant {
+            let text = collect_text(msg);
+            if !text.is_empty() {
+                conversation_text.push_str(&text);
+                conversation_text.push('\n');
+            }
+        }
+    }
+
+    if conversation_text.is_empty() {
+        return Ok(());
+    }
+
+    // Build summarization prompt
+    let summary_prompt = format!(
+        "Summarize the following assistant actions in one sentence:\n\n{}",
+        conversation_text.trim()
+    );
+
+    let summary_messages = vec![
+        Message::system("You summarize assistant actions into one concise sentence. Output only the summary, no preamble."),
+        Message::user(&summary_prompt),
+    ];
+
+    // Call LLM with no tools, collect the response
+    let mut summary = String::new();
+    let tools: Vec<ToolDef> = Vec::new();
+    if let Ok(mut stream) = state.provider.stream_chat(&summary_messages, &tools).await {
+        while let Some(event) = stream.next().await {
+            if let Ok(LLMEvent::Text(text)) = event {
+                summary.push_str(&text);
+            }
+        }
+    }
+
+    if summary.is_empty() {
+        summary = "Assistant actions were summarized.".to_string();
+    }
+
+    let summary_msg = Message::system(format!("{}{}]", SUMMARY_PREFIX, summary.trim()));
+    state.session.messages.insert(0, summary_msg);
+    state.summarized_count += 1;
+
+    Ok(())
+}
+
+/// Finds the index of the last message before the cutoff for summarization.
+/// Returns the index of the last assistant/tool message to summarize,
+/// keeping at least the most recent user message and everything after it.
+fn find_summarize_cutoff(messages: &[Message]) -> usize {
+    // Find the second-to-last user message from the end
+    // We want to keep the last user message and everything after
+    let mut user_count = 0;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        if msg.role == Role::User {
+            user_count += 1;
+            if user_count >= 2 {
+                return i.saturating_sub(1);
+            }
+        }
+    }
+
+    // If there aren't multiple user messages, try to summarize everything
+    // except the last few assistant turns
+    let mut count = 0;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        if msg.role == Role::Assistant {
+            count += 1;
+            if count >= 3 {
+                return i.saturating_sub(1);
+            }
+        }
+    }
+
+    0
+}
+
 fn estimate_tokens(text: &str) -> usize {
     text.len() / 4 + text.chars().filter(|&c| c == ' ').count() / 2
 }
@@ -173,6 +351,9 @@ pub struct ChatState {
     pub sandbox: Sandbox,
     pub config: Arc<Config>,
     pub model: String,
+    pub max_context_tokens: usize,
+    pub max_tool_output_storage: usize,
+    pub summarized_count: usize,
 }
 
 impl ChatState {
@@ -182,6 +363,8 @@ impl ChatState {
         model: String,
     ) -> Self {
         let provider_name = provider.name().to_string();
+        let max_context_tokens = config.advanced.max_context_tokens;
+        let max_tool_output_storage = config.advanced.max_tool_output_storage;
         Self {
             session: Session::new(&model, &provider_name),
             provider,
@@ -189,6 +372,9 @@ impl ChatState {
             sandbox: Sandbox::from_config(&config),
             config,
             model,
+            max_context_tokens,
+            max_tool_output_storage,
+            summarized_count: 0,
         }
     }
 
@@ -361,6 +547,87 @@ impl TurnOutput for TuiOutput {
     }
 }
 
+fn truncate_for_storage(output: &str, max_chars: usize) -> String {
+    if output.len() > max_chars {
+        let prefix = if output.len() > 7 && (output.starts_with("SUCCESS") || output.starts_with("ERROR")) {
+            let space = output[..8].find(' ').unwrap_or(7);
+            output[..space].to_string()
+        } else {
+            "OUTPUT".to_string()
+        };
+        format!(
+            "{} (truncated, {} bytes total)\n{}",
+            prefix,
+            output.len(),
+            &output[..max_chars]
+        )
+    } else {
+        output.to_string()
+    }
+}
+
+fn strip_tool_call_inputs(messages: &mut Vec<Message>) {
+    let last_assistant = messages.iter().rposition(|m| m.role == Role::Assistant);
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if Some(i) == last_assistant {
+            continue;
+        }
+        for block in &mut msg.content {
+            if let ContentBlock::ToolUse { input, .. } = block {
+                *input = serde_json::json!({});
+            }
+        }
+    }
+}
+
+fn coalesce_text_blocks(messages: &mut Vec<Message>) {
+    for msg in messages.iter_mut() {
+        let mut i = 0;
+        while i + 1 < msg.content.len() {
+            let should_merge = matches!(&msg.content[i], ContentBlock::Text { .. })
+                && matches!(&msg.content[i + 1], ContentBlock::Text { .. });
+            if !should_merge {
+                i += 1;
+                continue;
+            }
+            let second = match msg.content.remove(i + 1) {
+                ContentBlock::Text { text } => text,
+                _ => unreachable!(),
+            };
+            if let ContentBlock::Text { text } = &mut msg.content[i] {
+                text.push_str(&second);
+            }
+        }
+    }
+}
+
+fn drop_stale_tool_results(messages: &mut Vec<Message>, keep_assistant_turns: usize) {
+    let mut assist_count = 0;
+    let cutoff = messages.iter().rposition(|m| {
+        if m.role == Role::Assistant {
+            assist_count += 1;
+        }
+        assist_count >= keep_assistant_turns
+    });
+
+    let Some(mut cutoff) = cutoff else {
+        return;
+    };
+
+    let mut i = 0;
+    while i < cutoff {
+        if messages[i].role == Role::Tool {
+            messages.remove(i);
+            cutoff = cutoff.saturating_sub(1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 async fn process_turn_inner<O: TurnOutput>(
     state: &mut ChatState,
     output: &mut O,
@@ -375,7 +642,14 @@ async fn process_turn_inner<O: TurnOutput>(
         }
         turn_count += 1;
 
-        truncate_messages(&mut state.session.messages, MAX_CONTEXT_TOKENS);
+        drop_stale_tool_results(&mut state.session.messages, 10);
+        strip_tool_call_inputs(&mut state.session.messages);
+        coalesce_text_blocks(&mut state.session.messages);
+        truncate_messages(&mut state.session.messages, state.max_context_tokens * 3);
+
+        if let Err(e) = maybe_summarize(state).await {
+            tracing::warn!("summarization failed: {}", e);
+        }
 
         output.start_turn();
 
@@ -391,17 +665,21 @@ async fn process_turn_inner<O: TurnOutput>(
         let mut content_blocks = Vec::new();
         let mut has_streamed_text = false;
         let mut last_usage: Option<Usage> = None;
+        let mut in_think_block = false;
 
         while let Some(event) = stream.next().await {
             match event? {
                 LLMEvent::Text(text) => {
-                    output.on_text(&text);
-                    text_accum.push_str(&text);
-                    has_streamed_text = true;
+                    let cleaned = strip_think(&text, &mut in_think_block);
+                    if !cleaned.is_empty() {
+                        output.on_text(&cleaned);
+                        text_accum.push_str(&cleaned);
+                        has_streamed_text = true;
+                    }
                 }
                 LLMEvent::ToolCall { id, name, args } => {
                     if !text_accum.is_empty() {
-                        let text = std::mem::take(&mut text_accum);
+                        let text = strip_think_final(std::mem::take(&mut text_accum));
                         content_blocks.push(ContentBlock::Text { text });
                     }
                     output.on_tool_call(&name, &args);
@@ -412,7 +690,7 @@ async fn process_turn_inner<O: TurnOutput>(
                 }
                 LLMEvent::Stop { finish_reason } => {
                     if !text_accum.is_empty() {
-                        let text = std::mem::take(&mut text_accum);
+                        let text = strip_think_final(std::mem::take(&mut text_accum));
                         content_blocks.push(ContentBlock::Text { text });
                     }
                     tracing::debug!(reason = finish_reason, "stream stopped");
@@ -487,9 +765,10 @@ async fn process_turn_inner<O: TurnOutput>(
 
             let result = state.registry.execute(name, args.clone()).await;
             let output_text = format_result(&result);
+            let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
 
             output.on_tool_result(name, &output_text);
-            state.session.messages.push(Message::tool_result(id, output_text));
+            state.session.messages.push(Message::tool_result(id, stored_text));
         }
     }
 }
@@ -565,7 +844,7 @@ async fn handle_slash_command_tui(
         "/exit" | "/quit" => Ok(SlashResultTui::Exit),
         "/help" => {
             let _ = event_tx.send(AppEvent::Info(
-                "Available: /exit, /clear, /model, /tokens, /provider, /browse, /sessions, /resume\nPress Tab/F1 for full help screen.".into()
+                "Available: /exit, /clear, /model, /tokens, /summarize, /provider, /browse, /sessions, /resume, /update\nPress Tab/F1 for full help screen.".into()
             ));
             Ok(SlashResultTui::Continue)
         }
@@ -582,7 +861,7 @@ async fn handle_slash_command_tui(
         }
         "/model" => {
             if arg.is_empty() {
-                let _ = event_tx.send(AppEvent::Info(format!("Current model: {}", state.model)));
+                let _ = event_tx.send(AppEvent::OpenBrowse);
             } else {
                 state.model = arg.to_string();
                 state.provider.set_model(&state.model);
@@ -635,7 +914,12 @@ async fn handle_slash_command_tui(
             let in_t = state.session.input_tokens;
             let out_t = state.session.output_tokens;
             let cost_val = state.session.total_cost;
-            let mut info = format!("Input tokens: {}, Output tokens: {}", in_t, out_t);
+            let estimated: usize = state.session.messages.iter().map(estimate_message_tokens).sum();
+            let limit = state.max_context_tokens;
+            let mut info = format!(
+                "Input tokens: {}, Output tokens: {}\nContext: ~{} / ~{} tokens  (summarized {} rounds)",
+                in_t, out_t, estimated, limit, state.summarized_count,
+            );
             if cost_val > 0.0 {
                 info.push_str(&format!("\nTotal cost: ${:.6}", cost_val));
             }
@@ -643,9 +927,44 @@ async fn handle_slash_command_tui(
                 info.push_str(&format!("\n  #{}: {} in + {} out = ${:.6}",
                     i + 1, rc.prompt_tokens, rc.completion_tokens, rc.cost));
             }
-            let estimated: usize = state.session.messages.iter().map(estimate_message_tokens).sum();
-            info.push_str(&format!("\nContext estimate: ~{} tokens", estimated));
             let _ = event_tx.send(AppEvent::Info(info));
+            Ok(SlashResultTui::Continue)
+        }
+        "/summarize" => {
+            let before = state.session.messages.len();
+            match maybe_summarize(state).await {
+                Ok(()) => {
+                    let removed = before - state.session.messages.len();
+                    let msg = if removed > 0 {
+                        format!("Summarized {} old messages ({} rounds total)", removed, state.summarized_count)
+                    } else {
+                        "Nothing to summarize, context is under the limit.".to_string()
+                    };
+                    let _ = event_tx.send(AppEvent::Info(msg));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(format!("Summarize failed: {}", e)));
+                }
+            }
+            Ok(SlashResultTui::Continue)
+        }
+        "/update" => {
+            let _ = event_tx.send(AppEvent::Info("Pulling changes and building...".into()));
+            let event_tx_clone = event_tx.clone();
+            tokio::spawn(async move {
+                match crate::update::perform_update() {
+                    Ok(()) => {
+                        let _ = event_tx_clone.send(AppEvent::Info(
+                            "Update complete! Restart to use the new version.".into()
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = event_tx_clone.send(AppEvent::Error(
+                            format!("Update failed: {}", e)
+                        ));
+                    }
+                }
+            });
             Ok(SlashResultTui::Continue)
         }
         "/browse" => {
@@ -712,7 +1031,7 @@ async fn handle_slash_command_tui(
     }
 }
 
-pub async fn run_tui_interactive(mut state: ChatState) -> anyhow::Result<()> {
+pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u32>) -> anyhow::Result<()> {
     use crate::tui_app::{self, TuiApp, AppEvent};
 
     add_system_prompt(&mut state);
@@ -722,8 +1041,15 @@ pub async fn run_tui_interactive(mut state: ChatState) -> anyhow::Result<()> {
 
     let model = state.model.clone();
     let provider_name = state.provider.name().to_string();
+    let preferred_models = state.config.provider_config()
+        .map(|c| c.preferred_models.clone())
+        .unwrap_or_default();
 
-    let mut app = TuiApp::new(&model, &provider_name, event_rx);
+    let mut app = TuiApp::new(&model, &provider_name, event_rx, latest_release, &preferred_models);
+
+    if let Some(ver) = latest_release {
+        let _ = event_tx.send(AppEvent::UpdateAvailable(ver));
+    }
 
     // Spawn processing on tokio runtime
     let processing = tokio::spawn(async move {
@@ -886,5 +1212,79 @@ mod tests {
         let r = ToolResult { success: true, output: "x".repeat(2500) };
         let out = format_result(&r);
         assert!(out.starts_with("SUCCESS (truncated, 2500 bytes total)"));
+    }
+
+    // --- strip_think tests ---
+
+    #[test]
+    fn test_strip_think_no_block() {
+        let mut in_block = false;
+        let result = strip_think("hello world", &mut in_block);
+        assert_eq!(result, "hello world");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn test_strip_think_complete_block() {
+        let mut in_block = false;
+        let result = strip_think("hello <think>reasoning</think> world", &mut in_block);
+        assert_eq!(result, "hello  world");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn test_strip_think_only_block() {
+        let mut in_block = false;
+        let result = strip_think("<think>deep reasoning</think>", &mut in_block);
+        assert_eq!(result, "");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn test_strip_think_multi_blocks() {
+        let mut in_block = false;
+        let result = strip_think("a <think>r1</think> b <think>r2</think> c", &mut in_block);
+        assert_eq!(result, "a  b  c");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn test_strip_think_streaming_open() {
+        let mut in_block = false;
+        // First chunk opens the block
+        let r1 = strip_think("start <think>reasoning", &mut in_block);
+        assert_eq!(r1, "start ");
+        assert!(in_block);
+        // Second chunk closes it
+        let r2 = strip_think(" continues</think> end", &mut in_block);
+        assert_eq!(r2, " end");
+        assert!(!in_block);
+    }
+
+    #[test]
+    fn test_strip_think_partial_tag_boundary() {
+        // When <think> is split across chunks, the streaming strip_think
+        // won't catch it. The final clean-up pass handles it.
+        let mut in_block = false;
+        let _r1 = strip_think("hello <thi", &mut in_block);
+        assert!(!in_block);
+        let r2 = strip_think("nk>hidden</think> world", &mut in_block);
+        assert_eq!(r2, "nk>hidden</think> world");
+        assert!(!in_block);
+        // Final pass strips the split think block
+        let combined = strip_think_final("hello <think>hidden</think> world".into());
+        assert_eq!(combined, "hello  world");
+    }
+
+    #[test]
+    fn test_strip_think_final_cleanup() {
+        let result = strip_think_final("a <think>r1</think> b <think>r2</think> c".into());
+        assert_eq!(result, "a  b  c");
+    }
+
+    #[test]
+    fn test_strip_think_final_noop() {
+        let result = strip_think_final("no think blocks here".into());
+        assert_eq!(result, "no think blocks here");
     }
 }

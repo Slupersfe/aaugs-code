@@ -41,11 +41,6 @@ pub fn run(path: &PathBuf) -> anyhow::Result<()> {
         .with_prompt("API key")
         .interact_text()?;
 
-    let model: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Model (enter for default)")
-        .allow_empty(true)
-        .interact_text()?;
-
     let default_models = [
         "anthropic/claude-sonnet-4",
         "claude-sonnet-4-20250514",
@@ -53,11 +48,22 @@ pub fn run(path: &PathBuf) -> anyhow::Result<()> {
         "gemini-2.5-pro",
         "big-pickle",
     ];
-    let resolved_model = if model.is_empty() {
-        default_models[provider].to_string()
-    } else {
-        model
-    };
+    let resolved_model = default_models[provider].to_string();
+
+    println!();
+    println!("── Preferred Models ──");
+    println!("(Enter model IDs one at a time. Empty line to finish.)");
+    let mut preferred_models: Vec<String> = Vec::new();
+    loop {
+        let pref: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Preferred model")
+            .allow_empty(true)
+            .interact_text()?;
+        if pref.is_empty() {
+            break;
+        }
+        preferred_models.push(pref);
+    }
 
     println!();
     println!("── Tool Permissions ──");
@@ -65,7 +71,7 @@ pub fn run(path: &PathBuf) -> anyhow::Result<()> {
     let bash_perm = permission_select("bash (run shell commands)")?;
     let write_perm = permission_select("write (create/edit files)")?;
 
-    let config = build_config(provider_key, &api_key, &resolved_model, &bash_perm, &write_perm)?;
+    let config = build_config(provider_key, &api_key, &resolved_model, &preferred_models, &bash_perm, &write_perm)?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -97,6 +103,7 @@ fn build_config(
     provider: &str,
     api_key: &str,
     model: &str,
+    preferred_models: &[String],
     bash_perm: &str,
     write_perm: &str,
 ) -> anyhow::Result<serde_json::Value> {
@@ -145,6 +152,9 @@ fn build_config(
     // Set the chosen provider's api_key and model
     cfg[provider]["api_key"] = json!(api_key);
     cfg[provider]["model"] = json!(model);
+    if !preferred_models.is_empty() {
+        cfg[provider]["preferred_models"] = json!(preferred_models);
+    }
 
     Ok(cfg)
 }

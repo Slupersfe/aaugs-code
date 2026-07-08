@@ -8,6 +8,7 @@ mod sandbox;
 mod tools;
 mod tui;
 mod tui_app;
+mod update;
 
 use std::sync::Arc;
 
@@ -50,6 +51,12 @@ async fn main() -> anyhow::Result<()> {
             if cli.yes {
                 state.set_auto_approve(true);
             }
+
+            if let Ok(Some(latest)) = update::check_update().await {
+                let cur = update::current_release().unwrap_or(0);
+                eprintln!("Update available: v{} (current: v{}). Run /update to upgrade.", latest, cur);
+            }
+
             chat::run_once(&mut state, prompt).await?;
         }
         None => {
@@ -68,7 +75,20 @@ async fn main() -> anyhow::Result<()> {
             if cli.yes {
                 state.set_auto_approve(true);
             }
-            chat::run_tui_interactive(state).await?;
+
+            let latest_release = match update::check_update().await {
+                Ok(Some(v)) => {
+                    tracing::info!("update available: v{}", v);
+                    Some(v)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("update check failed: {}", e);
+                    None
+                }
+            };
+
+            chat::run_tui_interactive(state, latest_release).await?;
         }
     }
 

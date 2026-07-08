@@ -30,6 +30,7 @@ pub enum AppEvent {
     ModelChanged(String),
     Clear,
     OpenBrowse,
+    UpdateAvailable(u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +65,11 @@ pub struct TuiApp {
     browse_models: Vec<&'static str>,
     browse_cursor: usize,
     browse_filter: String,
+    browse_preferred_count: usize,
+    preferred: Vec<String>,
+    update_available: Option<u32>,
+    in_code_block: bool,
+    auto_scroll: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +83,8 @@ impl TuiApp {
         model: &str,
         provider: &str,
         event_rx: mpsc::Receiver<AppEvent>,
+        latest_release: Option<u32>,
+        preferred_models: &[String],
     ) -> Self {
         let help_content = build_help_pages();
         Self {
@@ -98,12 +106,17 @@ impl TuiApp {
             browse_models: Vec::new(),
             browse_cursor: 0,
             browse_filter: String::new(),
+            preferred: preferred_models.to_vec(),
+            browse_preferred_count: 0,
+            update_available: latest_release,
+            in_code_block: false,
+            auto_scroll: true,
         }
     }
 
     fn track_lines(&mut self, text: &str) {
         self.estimated_lines += text.lines().count().max(1);
-        self.scroll = self.estimated_lines;
+        self.auto_scroll = true;
     }
 
     pub fn add_user_msg(&mut self, text: &str) {
@@ -168,23 +181,48 @@ impl TuiApp {
     }
 
     pub fn scroll_up(&mut self) {
+        self.auto_scroll = false;
         self.scroll = self.scroll.saturating_sub(1);
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
+        let max_scroll = self.estimated_lines.saturating_sub(1);
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_add(1).min(max_scroll);
     }
 
     pub fn open_browse(&mut self) {
-        let models = cost::models_for_provider(&self.provider);
-        if models.is_empty() {
-            self.browse_models = cost::MODEL_ITER.iter().map(|(n, _)| *n).collect();
+        let all_models = cost::models_for_provider(&self.provider);
+        let all_models: Vec<&'static str> = if all_models.is_empty() {
+            cost::MODEL_ITER.iter().map(|(n, _)| *n).collect()
         } else {
-            self.browse_models = models;
+            all_models
+        };
+
+        // Build list: preferred models first, then all others, no duplicates
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+
+        // We don't store preferred_models as &'static str, so match against all_models
+        // to find the static versions
+        for pref in &self.preferred {
+            if let Some(m) = all_models.iter().find(|m| **m == pref.as_str()) {
+                if seen.insert(m) {
+                    merged.push(*m);
+                }
+            }
         }
+        self.browse_preferred_count = merged.len();
+
+        for m in &all_models {
+            if seen.insert(m) {
+                merged.push(*m);
+            }
+        }
+
+        self.browse_models = merged;
         self.browse_cursor = 0;
         self.browse_filter = self.model.clone();
-        // Try to preselect current model
         if let Some(pos) = self.browse_models.iter().position(|m| *m == self.model.as_str()) {
             self.browse_cursor = pos;
         }
@@ -215,8 +253,10 @@ fn build_help_pages() -> Vec<HelpPage> {
             ("  /clear".to_string(), "Clear conversation".to_string(), None),
             ("  /model [name]".to_string(), "Show or change model".to_string(), None),
             ("  /browse".to_string(), "Browse & select models".to_string(), None),
+            ("  /update".to_string(), "Pull latest & rebuild".to_string(), None),
             ("  /provider [name]".to_string(), "Switch provider in-session".to_string(), None),
-            ("  /tokens".to_string(), "Show token usage & cost".to_string(), None),
+            ("  /tokens".to_string(), "Show token usage, context & cost".to_string(), None),
+            ("  /summarize".to_string(), "Manually summarize context".to_string(), None),
             ("  /sessions".to_string(), "List saved sessions".to_string(), None),
             ("  /resume <id>".to_string(), "Resume a saved session".to_string(), None),
         ],
@@ -316,7 +356,90 @@ fn build_help_pages() -> Vec<HelpPage> {
     pages
 }
 
-// --- Rendering ---
+// --- Markdown rendering ---
+
+fn push_md_line(text: &mut Text, line: &str, base_style: Style, in_code: &mut bool) {
+    if *in_code {
+        if line.trim_end() == "```" {
+            *in_code = false;
+            return;
+        }
+        text.push_line(Line::from(Span::styled(line.to_string(), base_style.bg(Color::Rgb(40, 40, 40)))));
+        return;
+    }
+    if line.trim_start().starts_with("```") {
+        *in_code = true;
+        return;
+    }
+
+    let trimmed = line.trim_start();
+    // Headers
+    if let Some(rest) = trimmed.strip_prefix("### ") {
+        text.push_line(Line::from(Span::styled(rest.to_string(), base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix("## ") {
+        text.push_line(Line::from(Span::styled(rest.to_string(), base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+        return;
+    }
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        text.push_line(Line::from(Span::styled(rest.to_string(), base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+        return;
+    }
+
+    // Inline markdown: parse **bold** and `code`
+    let spans = parse_inline_md(line, base_style);
+    text.push_line(Line::from(spans));
+}
+
+fn parse_inline_md(line: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Bold **...**
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base));
+            }
+            i += 2;
+            let mut bold = String::new();
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '*') {
+                bold.push(chars[i]);
+                i += 1;
+            }
+            if i + 1 < chars.len() {
+                i += 2; // skip closing **
+            }
+            spans.push(Span::styled(bold, base.add_modifier(Modifier::BOLD)));
+            continue;
+        }
+        // Inline code `...`
+        if chars[i] == '`' {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base));
+            }
+            i += 1;
+            let mut code = String::new();
+            while i < chars.len() && chars[i] != '`' {
+                code.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1; // skip closing `
+            }
+            spans.push(Span::styled(code, base.fg(Color::Cyan)));
+            continue;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, base));
+    }
+    spans
+}
 
 pub fn draw(frame: &mut Frame, app: &mut TuiApp) {
     match app.mode {
@@ -326,7 +449,7 @@ pub fn draw(frame: &mut Frame, app: &mut TuiApp) {
     }
 }
 
-fn draw_chat(frame: &mut Frame, app: &TuiApp) {
+fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -339,14 +462,20 @@ fn draw_chat(frame: &mut Frame, app: &TuiApp) {
         .split(area);
 
     // Status bar
+    let update_indicator = if let Some(ver) = app.update_available {
+        format!(" UPDATE v{} available! Run /update ", ver)
+    } else {
+        String::new()
+    };
     let status = format!(
-        " aaugs-code v{}  |  {}  |  {}  |  tokens: {} in / {} out  |  ${:.6}",
+        " aaugs-code v{}  |  {}  |  {}  |  tokens: {} in / {} out  |  ${:.6}{}",
         env!("CARGO_PKG_VERSION"),
         app.provider,
         app.model,
         app.input_tokens,
         app.output_tokens,
         app.total_cost,
+        update_indicator,
     );
     let status_bar = Paragraph::new(Span::styled(
         status,
@@ -354,10 +483,11 @@ fn draw_chat(frame: &mut Frame, app: &TuiApp) {
     ));
     frame.render_widget(status_bar, chunks[0]);
 
-    // Messages
+    // Messages with markdown rendering
     let mut text = Text::default();
+    let mut in_code = app.in_code_block;
     for msg in &app.messages {
-        let style = match msg.role.as_str() {
+        let base_style = match msg.role.as_str() {
             "User" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             "Assistant" => Style::default().fg(Color::White),
             "Tool" => Style::default().fg(Color::Yellow),
@@ -365,26 +495,16 @@ fn draw_chat(frame: &mut Frame, app: &TuiApp) {
             "System" => Style::default().fg(Color::DarkGray),
             _ => Style::default(),
         };
-        let prefix = match msg.role.as_str() {
-            "User" => "> ",
-            "Tool" => "  ",
-            _ => "  ",
-        };
+        let prefix = if msg.role == "User" { "> " } else if msg.role == "Tool" { "  " } else { "  " };
         for (i, line) in msg.text.lines().enumerate() {
-            if i == 0 {
-                text.push_line(Line::from(vec![
-                    Span::styled(prefix, style),
-                    Span::styled(line.to_string(), style),
-                ]));
-            } else {
-                text.push_line(Line::from(Span::styled(line.to_string(), style)));
+            if i == 0 && !prefix.trim().is_empty() {
+                text.push_line(Line::from(vec![Span::styled(prefix, base_style)]));
             }
+            push_md_line(&mut text, line, base_style, &mut in_code);
         }
     }
-    let msg_widget = Paragraph::new(text)
-        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)))
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll as u16, 0));
+    app.in_code_block = in_code;
+
     let msg_area = chunks[1];
     let msg_area_inner = Rect {
         x: msg_area.x,
@@ -392,6 +512,17 @@ fn draw_chat(frame: &mut Frame, app: &TuiApp) {
         width: msg_area.width,
         height: msg_area.height.saturating_sub(1),
     };
+
+    // Auto-scroll to bottom when new content arrives
+    if app.auto_scroll {
+        let h = msg_area_inner.height as usize;
+        app.scroll = app.estimated_lines.saturating_sub(h);
+    }
+
+    let msg_widget = Paragraph::new(text)
+        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll as u16, 0));
     frame.render_widget(msg_widget, msg_area_inner);
 
     // Input
@@ -516,13 +647,34 @@ fn draw_browse(frame: &mut Frame, app: &TuiApp) {
     )));
     text.push_line(Line::from(""));
 
+    let preferred_count = app.browse_preferred_count;
+    let all_count = app.browse_models.len();
+
     for (i, model_name) in app.browse_models.iter().enumerate() {
+        // Section headers
+        if i == 0 && preferred_count > 0 {
+            text.push_line(Line::from(Span::styled(
+                " ★ Preferred Models",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )));
+            text.push_line(Line::from(""));
+        }
+        if i == preferred_count && preferred_count > 0 && i < all_count {
+            text.push_line(Line::from(Span::styled(
+                " ── All Models ──",
+                Style::default().fg(Color::DarkGray),
+            )));
+            text.push_line(Line::from(""));
+        }
+
         let prefix = if i == app.browse_cursor { " > " } else { "   " };
         let (inp, outp) = cost::model_cost(model_name);
         let line = format!("{}{}  (${:.2}/{}k in, ${:.2}/{}k out)",
             prefix, model_name, inp, (inp * 4.0) as u32, outp, (outp * 4.0) as u32);
         let style = if i == app.browse_cursor {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if i < preferred_count {
+            Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::White)
         };
@@ -560,15 +712,11 @@ pub fn run_tui(
         match app.event_rx.try_recv() {
             Ok(event) => {
                 handle_app_event(app, event);
-                if let Err(mpsc::TryRecvError::Disconnected) = app.event_rx.try_recv() {
-                    // Flush any remaining events, then exit
-                    while let Ok(e) = app.event_rx.try_recv() {
-                        handle_app_event(app, e);
-                    }
-                    return Ok(());
-                }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
+                while let Ok(e) = app.event_rx.try_recv() {
+                    handle_app_event(app, e);
+                }
                 return Ok(());
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -763,7 +911,6 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
     match event {
         AppEvent::Text(text) => {
             app.add_assistant_text(&text);
-            app.is_loading = false;
         }
         AppEvent::ToolCall { name, args } => {
             app.add_assistant_text(&format!("\n-- tool: {} --", name));
@@ -810,6 +957,9 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
         }
         AppEvent::OpenBrowse => {
             app.open_browse();
+        }
+        AppEvent::UpdateAvailable(ver) => {
+            app.update_available = Some(ver);
         }
     }
 }
