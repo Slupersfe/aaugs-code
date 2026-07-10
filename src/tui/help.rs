@@ -17,7 +17,7 @@ pub(super) fn build_help_pages() -> Vec<HelpPage> {
             (String::new(), String::new(), None),
             ("  /help".to_string(), "Show this help".to_string(), None),
             ("  /exit  /quit".to_string(), "Exit the program".to_string(), None),
-            ("  /clear".to_string(), "Clear conversation".to_string(), None),
+            ("  /clear".to_string(), "Clear screen (visual only)".to_string(), None),
             ("  /model [name]".to_string(), "Show or change model".to_string(), None),
             ("  /browse".to_string(), "Browse & select models".to_string(), None),
             ("  /update".to_string(), "Pull latest & rebuild".to_string(), None),
@@ -26,6 +26,7 @@ pub(super) fn build_help_pages() -> Vec<HelpPage> {
             ("  /summarize".to_string(), "Manually summarize".to_string(), None),
             ("  /sessions".to_string(), "List saved sessions".to_string(), None),
             ("  /resume <id>".to_string(), "Resume a session".to_string(), None),
+            ("  /reload".to_string(), "Reload config from disk".to_string(), None),
         ],
     });
 
@@ -42,7 +43,7 @@ pub(super) fn build_help_pages() -> Vec<HelpPage> {
             ("Keybinds".to_string(), String::new(), Some(MAUVE)),
             (String::new(), String::new(), None),
             ("  Enter".to_string(), "Submit message".to_string(), None),
-            ("  Ctrl+C".to_string(), "Exit".to_string(), None),
+            ("  Ctrl+C".to_string(), "Exit / abort stream".to_string(), None),
             ("  Tab / F1".to_string(), "Toggle help".to_string(), None),
             ("  PgUp / PgDn".to_string(), "Scroll chat / help".to_string(), None),
             ("  Up / Down".to_string(), "Scroll messages".to_string(), None),

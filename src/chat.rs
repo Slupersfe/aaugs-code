@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -380,6 +381,7 @@ pub struct ChatState {
     pub auto_route: bool,
     pub max_context_tokens: usize,
     pub max_tool_output_storage: usize,
+    pub max_tool_result_truncation: usize,
     pub summarized_count: usize,
 }
 
@@ -392,6 +394,7 @@ impl ChatState {
         let provider_name = provider.name().to_string();
         let max_context_tokens = config.advanced.max_context_tokens;
         let max_tool_output_storage = config.advanced.max_tool_output_storage;
+        let max_tool_result_truncation = config.advanced.tool_result_truncation_bytes;
         let auto_route = config.provider_config()
             .and_then(|c| c.auto_route)
             .unwrap_or(true)
@@ -406,6 +409,7 @@ impl ChatState {
             auto_route,
             max_context_tokens,
             max_tool_output_storage,
+            max_tool_result_truncation,
             summarized_count: 0,
         }
     }
@@ -486,6 +490,7 @@ trait TurnOutput {
     fn on_usage(&mut self, _prompt: u32, _completion: u32, _cost: f64) {}
     async fn request_permission(&mut self, sandbox: &Sandbox, name: &str, description: &str) -> bool;
     fn flush_output(&mut self) -> anyhow::Result<()> { Ok(()) }
+    fn is_cancelled(&self) -> bool { false }
 }
 
 struct StdoutOutput {
@@ -549,12 +554,13 @@ impl TurnOutput for StdoutOutput {
 
 struct TuiOutput {
     event_tx: std::sync::mpsc::Sender<crate::tui::AppEvent>,
+    cancelled: Arc<AtomicBool>,
     has_streamed_text: bool,
 }
 
 impl TuiOutput {
-    fn new(event_tx: std::sync::mpsc::Sender<crate::tui::AppEvent>) -> Self {
-        Self { event_tx, has_streamed_text: false }
+    fn new(event_tx: std::sync::mpsc::Sender<crate::tui::AppEvent>, cancelled: Arc<AtomicBool>) -> Self {
+        Self { event_tx, cancelled, has_streamed_text: false }
     }
 }
 
@@ -629,6 +635,9 @@ impl TurnOutput for TuiOutput {
                 }
             }
         }
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
     }
 }
 
@@ -764,6 +773,12 @@ async fn process_turn_inner<O: TurnOutput>(
         let mut in_think_block = false;
 
         while let Some(event) = stream.next().await {
+            if output.is_cancelled() {
+                let _ = std::mem::take(&mut text_accum);
+                let _ = std::mem::take(&mut content_blocks);
+                has_streamed_text = false;
+                break;
+            }
             match event? {
                 LLMEvent::Text(text) => {
                     let cleaned = strip_think(&text, &mut in_think_block);
@@ -858,7 +873,7 @@ async fn process_turn_inner<O: TurnOutput>(
                 state.session.messages.push(Message::tool_result(id, format!("tool '{}' was denied", name)));
             } else {
                 let result = state.registry.execute(&name, args).await;
-                let output_text = format_result(&result);
+                let output_text = format_result(&result, state.max_tool_result_truncation);
                 let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
                 output.on_tool_result(&name, &output_text);
                 state.session.messages.push(Message::tool_result(id, stored_text));
@@ -888,7 +903,7 @@ async fn process_turn_inner<O: TurnOutput>(
                     });
                 }
                 while let Some((id, name, result)) = tasks.next().await {
-                    let output_text = format_result(&result);
+                    let output_text = format_result(&result, state.max_tool_result_truncation);
                     let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
                     output.on_tool_result(&name, &output_text);
                     state.session.messages.push(Message::tool_result(id, stored_text));
@@ -967,13 +982,13 @@ pub async fn process_turn(state: &mut ChatState) -> anyhow::Result<bool> {
     result
 }
 
-fn format_result(result: &ToolResult) -> String {
-    if result.output.len() > 2000 {
+fn format_result(result: &ToolResult, max_bytes: usize) -> String {
+    if result.output.len() > max_bytes {
         format!(
             "{} (truncated, {} bytes total)\n{}",
             if result.success { "SUCCESS" } else { "ERROR" },
             result.output.len(),
-            &result.output[..2000]
+            &result.output[..max_bytes]
         )
     } else {
         result.output.clone()
@@ -1007,8 +1022,9 @@ pub async fn run_once(state: &mut ChatState, prompt: &str) -> anyhow::Result<()>
 pub async fn process_turn_tui(
     state: &mut ChatState,
     event_tx: &std::sync::mpsc::Sender<crate::tui::AppEvent>,
+    cancelled: Arc<AtomicBool>,
 ) -> anyhow::Result<bool> {
-    let mut output = TuiOutput::new(event_tx.clone());
+    let mut output = TuiOutput::new(event_tx.clone(), cancelled);
     process_turn_inner(state, &mut output).await
 }
 
@@ -1223,6 +1239,28 @@ async fn handle_slash_command_tui(
             }
             Ok(SlashResultTui::Continue)
         }
+        "/reload" => {
+            let config_path = match Config::default_path() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = event_tx.send(AppEvent::Error("Cannot determine config path".into()));
+                    return Ok(SlashResultTui::Continue);
+                }
+            };
+            match Config::load(&config_path) {
+                Ok(cfg) => {
+                    state.config = Arc::new(cfg);
+                    if let Ok(new_provider) = crate::llm::resolve_provider(&state.config) {
+                        state.provider = new_provider;
+                    }
+                    let _ = event_tx.send(AppEvent::Info("Config reloaded".into()));
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(format!("Failed to reload config: {}", e)));
+                }
+            }
+            Ok(SlashResultTui::Continue)
+        }
         "/resume" => {
             if arg.is_empty() {
                 let _ = event_tx.send(AppEvent::Info("Usage: /resume <session_id>".into()));
@@ -1271,6 +1309,8 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
 
     let (event_tx, event_rx) = std::sync::mpsc::channel::<AppEvent>();
     let (input_tx, input_rx) = std::sync::mpsc::channel::<String>();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_tui = cancelled.clone();
 
     let model = state.model.clone();
     let provider_name = state.provider.name().to_string();
@@ -1278,7 +1318,7 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
         .map(|c| c.effective_models())
         .unwrap_or_default();
 
-    let mut app = TuiApp::new(&model, &provider_name, state.auto_route, event_rx, latest_release, &preferred_models);
+    let mut app = TuiApp::new(&model, &provider_name, state.auto_route, event_rx, latest_release, &preferred_models, state.config.advanced.tool_output_truncation_chars);
 
     if let Some(ver) = latest_release {
         let _ = event_tx.send(AppEvent::UpdateAvailable(ver));
@@ -1302,7 +1342,8 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
             state.session.messages.push(Message::user(&input));
             state.session.auto_title();
 
-            if !process_turn_tui(&mut state, &event_tx).await? {
+            cancelled.store(false, Ordering::SeqCst);
+            if !process_turn_tui(&mut state, &event_tx, cancelled.clone()).await? {
                 break;
             }
         }
@@ -1322,7 +1363,7 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
         )?;
         terminal.clear()?;
-        let result = tui::run_tui(&mut app, &mut terminal, &tui_input_tx);
+        let result = tui::run_tui(&mut app, &mut terminal, &tui_input_tx, &cancelled_tui);
         crossterm::terminal::disable_raw_mode()?;
         result
     });
@@ -1352,7 +1393,7 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
     Ok(())
 }
 
-/// Full-text search across all session files.
+/// Full-text search across all session files. Matches both titles and message content.
 fn search_sessions(query: &str) -> Vec<(String, String)> {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -1399,7 +1440,13 @@ fn search_sessions(query: &str) -> Vec<(String, String)> {
         } else {
             format!("{} ({})", session.title, &session.id[..8])
         };
-        // Find a matching snippet
+        // Title match — show without snippet
+        let title_lower = session.title.to_lowercase();
+        if title_lower.contains(&query_lower) {
+            results.push((display_name, String::new()));
+            continue;
+        }
+        // Find a matching snippet in message content
         let snippet = session.messages.iter()
             .filter_map(|m| {
                 for block in &m.content {
@@ -1502,7 +1549,7 @@ mod tests {
     #[test]
     fn test_format_result_short() {
         let r = ToolResult { success: true, output: "ok".to_string() };
-        let out = format_result(&r);
+        let out = format_result(&r, 2000);
         assert_eq!(out, "ok");
     }
 
@@ -1510,7 +1557,7 @@ mod tests {
     fn test_format_result_long_truncated() {
         let long = "x".repeat(3000);
         let r = ToolResult { success: false, output: long };
-        let out = format_result(&r);
+        let out = format_result(&r, 2000);
         assert!(out.starts_with("ERROR (truncated, 3000 bytes total)"));
         // "ERROR (truncated, 3000 bytes total)\n" + 2000 content chars
         assert_eq!(out.len(), 36 + 2000);
@@ -1519,7 +1566,7 @@ mod tests {
     #[test]
     fn test_format_result_success_prefix() {
         let r = ToolResult { success: true, output: "x".repeat(2500) };
-        let out = format_result(&r);
+        let out = format_result(&r, 2000);
         assert!(out.starts_with("SUCCESS (truncated, 2500 bytes total)"));
     }
 

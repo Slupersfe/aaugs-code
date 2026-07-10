@@ -4,7 +4,8 @@ mod chat;
 mod browse;
 mod help;
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,6 +23,7 @@ pub enum AppEvent {
     ToolResult { name: String, output: String },
     ToolDenied { name: String },
     TurnDone,
+    Cancel,
     Error(String),
     Usage {
         prompt_tokens: u32,
@@ -79,6 +81,10 @@ pub struct TuiApp {
     update_available: Option<u32>,
     in_code_block: bool,
     auto_scroll: bool,
+    pub tool_truncation: usize,
+    spinner_frame: u8,
+    search_query: String,
+    search_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +101,7 @@ impl TuiApp {
         event_rx: mpsc::Receiver<AppEvent>,
         latest_release: Option<u32>,
         preferred_models: &[String],
+        tool_truncation: usize,
     ) -> Self {
         let help_content = help::build_help_pages();
         Self {
@@ -122,6 +129,10 @@ impl TuiApp {
             update_available: latest_release,
             in_code_block: false,
             auto_scroll: true,
+            tool_truncation,
+            spinner_frame: 0,
+            search_query: String::new(),
+            search_active: false,
         }
     }
 
@@ -151,8 +162,9 @@ impl TuiApp {
     }
 
     pub fn add_tool_msg(&mut self, name: &str, output: &str) {
-        let display = if output.len() > 200 {
-            format!("── {} ──\n{}... (truncated)", name, &output[..200])
+        let limit = self.tool_truncation;
+        let display = if output.len() > limit {
+            format!("── {} ──\n{}... (truncated)", name, &output[..limit])
         } else {
             format!("── {} ──\n{}", name, output)
         };
@@ -238,6 +250,62 @@ impl TuiApp {
     pub fn help_scroll_down(&mut self) {
         self.help_scroll = self.help_scroll.saturating_add(1);
     }
+
+    /// Move cursor to start of previous word (or to position 0).
+    fn word_left(&mut self) {
+        let before = &self.input[..byte_idx(&self.input, self.cursor)];
+        let pos = before
+            .char_indices()
+            .rev()
+            .skip_while(|(_, c)| c.is_whitespace())
+            .skip_while(|(_, c)| !c.is_whitespace())
+            .next()
+            .map(|(i, _)| self.input[..i].chars().count())
+            .unwrap_or(0);
+        self.cursor = pos;
+    }
+
+    /// Move cursor to start of next word (or to end of input).
+    fn word_right(&mut self) {
+        let after = &self.input[byte_idx(&self.input, self.cursor)..];
+        let pos = self.cursor
+            + after
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .skip_while(|c| !c.is_whitespace())
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+        self.cursor = pos.min(self.input.len());
+        // If we didn't move at all, jump to end
+        if self.cursor < after.len() {
+            let remaining = &self.input[byte_idx(&self.input, self.cursor)..];
+            let next_word = remaining
+                .chars()
+                .skip_while(|c| c.is_whitespace());
+            let skip: usize = next_word.map(|c| c.len_utf8()).sum();
+            if skip > 0 {
+                self.cursor = (self.cursor + skip).min(self.input.len());
+            }
+        }
+    }
+
+    /// Delete the word behind the cursor (Ctrl+Backspace).
+    fn delete_word_left(&mut self) {
+        let before = &self.input[..byte_idx(&self.input, self.cursor)];
+        let pos = before
+            .char_indices()
+            .rev()
+            .skip_while(|(_, c)| c.is_whitespace())
+            .skip_while(|(_, c)| !c.is_whitespace())
+            .next()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let old_len = self.input.len();
+        self.input.drain(pos..byte_idx(&self.input, self.cursor));
+        let removed = self.input.len().abs_diff(old_len);
+        self.cursor = self.cursor.saturating_sub(removed);
+    }
 }
 
 // ── Render dispatcher ─────────────────────────────────────────────────
@@ -256,9 +324,11 @@ pub fn run_tui(
     app: &mut TuiApp,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     input_tx: &mpsc::Sender<String>,
+    cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
 
         loop {
             match app.event_rx.try_recv() {
@@ -274,7 +344,7 @@ pub fn run_tui(
                     let mut should_exit = false;
                     match app.mode {
                         AppMode::Chat => {
-                            handle_chat_key(app, key, input_tx, &mut should_exit);
+                            handle_chat_key(app, key, input_tx, &mut should_exit, cancelled);
                             if should_exit {
                                 return Ok(());
                             }
@@ -310,6 +380,7 @@ fn handle_chat_key(
     key: crossterm::event::KeyEvent,
     input_tx: &mpsc::Sender<String>,
     should_exit: &mut bool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     if app.pending_question.is_some() {
         handle_question_input(app, key, should_exit);
@@ -317,8 +388,42 @@ fn handle_chat_key(
     }
 
     match key.code {
+        // ── Search mode ──────────────────────────────────
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) && !app.search_active => {
+            app.search_active = true;
+            app.search_query.clear();
+        }
+        KeyCode::Esc if app.search_active => {
+            app.search_active = false;
+            app.search_query.clear();
+        }
+        KeyCode::Enter if app.search_active => {
+            app.search_active = false;
+        }
+        KeyCode::Backspace if app.search_active => {
+            app.search_query.pop();
+        }
+        KeyCode::Char(c) if app.search_active => {
+            app.search_query.push(c);
+        }
+
+        // ── Normal mode ──────────────────────────────────
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            *should_exit = true;
+            if app.is_loading {
+                cancelled.store(true, Ordering::SeqCst);
+                app.is_loading = false;
+            } else {
+                *should_exit = true;
+            }
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.word_right();
+        }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.word_left();
+        }
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.delete_word_left();
         }
         KeyCode::Tab | KeyCode::F(1) => {
             app.mode = AppMode::Help;
@@ -444,6 +549,9 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
             app.add_tool_denied(&name);
         }
         AppEvent::TurnDone => {
+            app.is_loading = false;
+        }
+        AppEvent::Cancel => {
             app.is_loading = false;
         }
         AppEvent::Error(err) => {

@@ -9,6 +9,8 @@ use super::palette::{
 };
 use super::TuiApp;
 
+const SPINNER_CHARS: &[char] = &['◜', '◝', '◞', '◟'];
+
 pub(super) fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -31,7 +33,7 @@ pub(super) fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     draw_input(frame, app, chunks[2]);
 
     // ── Keybinds bar ──────────────────────────────────────────────────
-    draw_keybinds(frame, chunks[3]);
+    draw_keybinds(frame, app, chunks[3]);
 
     // ── Question overlay ──────────────────────────────────────────────
     if app.pending_question.is_some() {
@@ -106,9 +108,12 @@ fn draw_status_bar(frame: &mut Frame, app: &TuiApp, area: Rect) {
 fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let mut text = Text::default();
     let mut in_code = app.in_code_block;
+    let search = app.search_query.to_lowercase();
+    let search_active = app.search_active && !search.is_empty();
 
-    // Build message lines
     for msg in &app.messages {
+        let matches = !search_active || msg.text.to_lowercase().contains(&search);
+
         let (gutter_color, role_fg) = match msg.role.as_str() {
             "User" => (GREEN, GREEN),
             "Assistant" => (BLUE, TEXT),
@@ -131,12 +136,9 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         text.push_line(role_line);
 
         // Message content
-        let base = Style::default().fg(role_fg);
+        let base = Style::default().fg(if matches { role_fg } else { SUBTLE });
         for line in msg.text.lines() {
             let indent = Span::styled("  ", base);
-            // We need to incorporate the indent into the line
-            // Build the line with indent + parsed content
-            // Use a temporary text for parsing, then prepend indent
             let mut line_text = Text::default();
             super::markdown::push_md_line(&mut line_text, line, base, &mut in_code);
             for text_line in line_text.lines.iter() {
@@ -158,7 +160,6 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     if app.auto_scroll {
         let h = msg_area_inner.height as usize;
         let total: usize = app.messages.iter().map(|m| m.text.lines().count()).sum();
-        // Add role lines
         let total = total + app.messages.len();
         app.scroll = total.saturating_sub(h);
     }
@@ -174,9 +175,14 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     frame.render_widget(msg_widget, msg_area_inner);
 }
 
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4 + text.chars().filter(|&c| c == ' ').count() / 2
+}
+
 fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let (fg, prompt) = if app.is_loading {
-        (SUBTLE, " ◌ ".to_string())
+        let spinner = SPINNER_CHARS[(app.spinner_frame as usize / 4) % SPINNER_CHARS.len()];
+        (SUBTLE, format!(" {} ", spinner))
     } else if app.pending_question.is_some() {
         (YELLOW, " ❓ ".to_string())
     } else if app.input.is_empty() {
@@ -184,6 +190,14 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     } else {
         (TEXT, " ❯ ".to_string())
     };
+
+    let tokens = if !app.is_loading && !app.input.is_empty() {
+        let est = estimate_tokens(&app.input);
+        format!(" ~{}t ", est)
+    } else {
+        String::new()
+    };
+
     let display = if app.is_loading {
         "waiting for response...".to_string()
     } else if app.pending_question.is_some() {
@@ -206,24 +220,50 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(prompt, Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)),
         Span::styled(display, Style::default().fg(fg)),
     ];
+    if !tokens.is_empty() {
+        let token_style = Style::default().fg(SUBTLE).add_modifier(Modifier::DIM);
+        let remaining = inner.width.saturating_sub(
+            spans.iter().map(|s| s.content.len() as u16).sum::<u16>() + tokens.len() as u16 + 1,
+        );
+        if remaining >= tokens.len() as u16 {
+            spans.push(Span::styled(" ".repeat(remaining as usize), Style::default()));
+            spans.push(Span::styled(tokens, token_style));
+        }
+    }
+
     let input_widget = Paragraph::new(Line::from(spans));
     frame.render_widget(input_widget, inner);
 }
 
-fn draw_keybinds(frame: &mut Frame, area: Rect) {
-    let keys = Paragraph::new(Line::from(vec![
-        Span::styled(" Tab/F1 Help ", Style::default().fg(BLUE)),
-        Span::styled("│", Style::default().fg(BORDER)),
-        Span::styled(" ↑/↓ Scroll ", Style::default().fg(BLUE)),
-        Span::styled("│", Style::default().fg(BORDER)),
-        Span::styled(" Enter Send ", Style::default().fg(BLUE)),
-        Span::styled("│", Style::default().fg(BORDER)),
-        Span::styled(" Ctrl+C Quit", Style::default().fg(BLUE)),
-    ]));
+fn draw_keybinds(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let keys = if app.search_active {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Ctrl+F:Search ", Style::default().fg(BLUE)),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(
+                format!(" query: {} ", app.search_query),
+                Style::default().fg(YELLOW),
+            ),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(" Esc:Close ", Style::default().fg(BLUE)),
+        ]))
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Tab/F1 Help ", Style::default().fg(BLUE)),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(" ↑/↓ Scroll ", Style::default().fg(BLUE)),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(" Enter Send ", Style::default().fg(BLUE)),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(" Ctrl+C Quit", Style::default().fg(BLUE)),
+            Span::styled("│", Style::default().fg(BORDER)),
+            Span::styled(" Ctrl+F Find", Style::default().fg(BLUE)),
+        ]))
+    };
     frame.render_widget(keys, area);
 }
 
