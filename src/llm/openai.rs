@@ -6,7 +6,6 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tracing;
 
 use super::{
     LLMError, LLMEvent, LLMProvider, Message, ToolDef, read_sse_stream,
@@ -21,6 +20,9 @@ pub struct OpenAIProvider {
     api_key: String,
     model: String,
     base_url: String,
+    max_tokens: u32,
+    temperature: f32,
+    provider_name: String,
 }
 
 #[derive(Serialize)]
@@ -29,6 +31,10 @@ struct OpenAIRequest {
     messages: Vec<OpenAIMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAITool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     stream: bool,
 }
 
@@ -72,12 +78,15 @@ struct OpenAIToolFunction {
 }
 
 impl OpenAIProvider {
-    pub fn new(cfg: &ProviderConfig) -> Self {
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
         Self {
             client: Client::new(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
             base_url: cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            max_tokens,
+            temperature,
+            provider_name: provider_name.to_string(),
         }
     }
 
@@ -188,7 +197,7 @@ impl OpenAIProvider {
 #[async_trait]
 impl LLMProvider for OpenAIProvider {
     fn name(&self) -> &str {
-        "openai"
+        &self.provider_name
     }
 
     fn default_model(&self) -> &str {
@@ -211,6 +220,8 @@ impl LLMProvider for OpenAIProvider {
             model: self.model.clone(),
             messages: api_messages,
             tools: api_tools,
+            max_tokens: Some(self.max_tokens),
+            temperature: Some(self.temperature),
             stream: true,
         };
 
@@ -287,6 +298,9 @@ impl LLMProvider for OpenAIProvider {
                             // Text content
                             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                                 text_buf.push_str(text);
+                                if !text.is_empty() {
+                                    let _ = tx.send(Ok(LLMEvent::Text(text.to_string())));
+                                }
                             }
 
                             // Tool calls
@@ -317,12 +331,8 @@ impl LLMProvider for OpenAIProvider {
                             // Finish reason
                             if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
                                 if !reason.is_empty() && reason != "null" {
-                                    // Flush text
-                                    if !text_buf.is_empty() {
-                                        let _ = tx.send(Ok(LLMEvent::Text(
-                                            std::mem::take(&mut text_buf),
-                                        )));
-                                    }
+                                    // Text already sent incrementally — clear buffer silently
+                                    let _ = std::mem::take(&mut text_buf);
 
                                     // Emit tool calls
                                     let mut indices: Vec<_> = tool_calls.keys().copied().collect();
@@ -361,10 +371,8 @@ impl LLMProvider for OpenAIProvider {
                 }
             }
 
-            // Flush any remaining text
-            if !text_buf.is_empty() {
-                let _ = tx.send(Ok(LLMEvent::Text(text_buf)));
-            }
+            // Text already sent incrementally — clear silently
+            let _ = std::mem::take(&mut text_buf);
         });
 
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);

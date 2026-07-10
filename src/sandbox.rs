@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 use crate::config::Config;
 
@@ -45,7 +46,7 @@ impl Sandbox {
             PermissionLevel::Allow => true,
             PermissionLevel::Deny => false,
             PermissionLevel::Ask => {
-                if !atty::is(atty::Stream::Stdin) {
+                if !std::io::stdin().is_terminal() {
                     // Non-TTY: auto-deny to avoid hanging
                     return false;
                 }

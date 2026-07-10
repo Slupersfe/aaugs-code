@@ -5,7 +5,6 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tracing;
 
 use super::{
     LLMError, LLMEvent, LLMProvider, Message, ToolDef, read_sse_stream,
@@ -20,6 +19,9 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     base_url: String,
+    max_tokens: u32,
+    temperature: f32,
+    provider_name: String,
 }
 
 #[derive(Serialize)]
@@ -27,10 +29,12 @@ struct AnthropicRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<serde_json::Value>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     stream: bool,
 }
 
@@ -48,12 +52,15 @@ struct AnthropicTool {
 }
 
 impl AnthropicProvider {
-    pub fn new(cfg: &ProviderConfig) -> Self {
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
         Self {
             client: Client::new(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
             base_url: cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            max_tokens,
+            temperature,
+            provider_name: provider_name.to_string(),
         }
     }
 
@@ -61,11 +68,12 @@ impl AnthropicProvider {
         self.base_url.trim_end_matches('/').to_string()
     }
 
-    fn convert_messages(&self, messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
-        let mut system: Option<String> = None;
+    fn convert_messages(&self, messages: &[Message]) -> (Option<serde_json::Value>, Vec<AnthropicMessage>) {
+        let mut system: Option<serde_json::Value> = None;
         let mut api_messages = Vec::new();
+        let total_msgs = messages.len();
 
-        for msg in messages {
+        for (idx, msg) in messages.iter().enumerate() {
             match msg.role {
                 Role::System => {
                     let text = msg.content.iter()
@@ -75,18 +83,34 @@ impl AnthropicProvider {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    system = Some(text);
+                    if !text.is_empty() {
+                        system = Some(json!([{
+                            "type": "text",
+                            "text": text,
+                            "cache_control": { "type": "ephemeral" }
+                        }]));
+                    }
                 }
                 Role::User => {
-                    let content = if msg.content.len() == 1 {
+                    let mut content = if msg.content.len() == 1 {
                         if let Some(ContentBlock::Text { text }) = msg.content.first() {
-                            json!(text)
+                            json!([{ "type": "text", "text": text }])
                         } else {
                             self.convert_content_blocks(&msg.content)
                         }
                     } else {
                         self.convert_content_blocks(&msg.content)
                     };
+                    // Cache the first user message for prompt caching on subsequent turns
+                    if idx == 0 && total_msgs > 1 {
+                        if let Value::Array(ref mut blocks) = content {
+                            if let Some(first) = blocks.first_mut() {
+                                if let Value::Object(ref mut map) = first {
+                                    map.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                                }
+                            }
+                        }
+                    }
                     api_messages.push(AnthropicMessage {
                         role: "user".to_string(),
                         content,
@@ -160,7 +184,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
     fn name(&self) -> &str {
-        "anthropic"
+        &self.provider_name
     }
 
     fn default_model(&self) -> &str {
@@ -181,10 +205,11 @@ impl LLMProvider for AnthropicProvider {
 
         let body = AnthropicRequest {
             model: self.model.clone(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system,
             messages: api_messages,
             tools: api_tools,
+            temperature: Some(self.temperature),
             stream: true,
         };
 
@@ -262,19 +287,18 @@ impl LLMProvider for AnthropicProvider {
                                                 text_buf.push_str(text);
                                             }
                                         }
-                                        Some("input_json_delta") => {
-                                            if in_tool_block {
+                                        Some("input_json_delta")
+                                            if in_tool_block => {
                                                 if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
                                                     tool_json_buf.push_str(partial);
                                                 }
                                             }
-                                        }
                                         _ => {}
                                     }
                                 }
                             }
-                            "content_block_stop" => {
-                                if in_tool_block {
+                            "content_block_stop"
+                                if in_tool_block => {
                                     in_tool_block = false;
                                     let args: Value = serde_json::from_str(&tool_json_buf)
                                         .unwrap_or_else(|e| {
@@ -289,7 +313,6 @@ impl LLMProvider for AnthropicProvider {
                                         }));
                                     }
                                 }
-                            }
                             "message_delta" => {
                                 // Flush remaining text
                                 if !text_buf.is_empty() {

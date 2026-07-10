@@ -110,7 +110,9 @@ impl StreamPrinter {
         if text.contains('\n') || !self.text_ends_with_newline(text) {
             // If there's a trailing partial line, we've advanced past it
         }
+        use std::io::Write;
         print!("{}", text);
+        let _ = std::io::stdout().flush();
     }
 
     fn text_ends_with_newline(&self, text: &str) -> bool {

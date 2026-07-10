@@ -4,6 +4,7 @@ mod openai;
 mod gemini;
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -208,21 +209,71 @@ pub async fn read_sse_stream(
     Ok(Box::pin(filtered))
 }
 
+/// Retries an async fallible operation with exponential backoff.
+/// Retries on HTTP 429 (rate limit) and 5xx (server errors) up to `max_retries` times.
+/// Non-retryable errors are returned immediately.
+pub async fn retry_with_backoff<F, Fut, T>(f: F, max_retries: u32) -> Result<T, LLMError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LLMError>>,
+{
+    for attempt in 0..=max_retries {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(LLMError::Http { status, body }) if status.as_u16() == 429 || status.as_u16() >= 500 => {
+                if attempt == max_retries {
+                    return Err(LLMError::Http { status: status.clone(), body: body.clone() });
+                }
+                let wait_ms = 1000u64 * 2u64.pow(attempt);
+                tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
 pub fn resolve_provider(config: &crate::config::Config) -> Result<Box<dyn LLMProvider>, LLMError> {
     let provider_cfg = config.provider_config()
         .ok_or_else(|| LLMError::Config(format!("provider '{}' is not configured", config.provider)))?;
 
     let api_format = config.resolved_api_format();
+    let max_tokens = config.advanced.max_tokens;
+    let temperature = config.advanced.temperature;
 
-    match config.provider.as_str() {
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(provider_cfg))),
-        "openai" => Ok(Box::new(openai::OpenAIProvider::new(provider_cfg))),
-        "gemini" => Ok(Box::new(gemini::GeminiProvider::new(provider_cfg))),
-        "opencode" => Ok(Box::new(openai::OpenAIProvider::new(provider_cfg))),
+    let pname = &config.provider;
+
+    let new_anthropic = || anthropic::AnthropicProvider::new(provider_cfg, max_tokens, temperature, pname);
+    let new_openai = || openai::OpenAIProvider::new(provider_cfg, max_tokens, temperature, pname);
+    let new_gemini = || gemini::GeminiProvider::new(provider_cfg, max_tokens, temperature, pname);
+
+    match pname.as_str() {
+        "anthropic" => Ok(Box::new(new_anthropic())),
+        "openai" => Ok(Box::new(new_openai())),
+        "gemini" => Ok(Box::new(new_gemini())),
+        "opencode" => {
+            let dev_path = dirs::home_dir()
+                .map(|h| h.join("vibe").join("dev.config"));
+            let dev_enabled = dev_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|s| s.trim() == "TRUE");
+            if !dev_enabled {
+                return Err(LLMError::Config(
+                    "opencode provider requires ~/vibe/dev.config with content 'TRUE'".into()
+                ));
+            }
+            Ok(Box::new(new_openai()))
+        }
         "openrouter" => match api_format {
-            "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(provider_cfg))),
-            _ => Ok(Box::new(openai::OpenAIProvider::new(provider_cfg))),
+            "anthropic" => Ok(Box::new(new_anthropic())),
+            _           => Ok(Box::new(new_openai())),
         },
-        _ => Err(LLMError::Config(format!("unknown provider '{}'", config.provider))),
+        "custom" => match api_format {
+            "anthropic" => Ok(Box::new(new_anthropic())),
+            "gemini" | "google" => Ok(Box::new(new_gemini())),
+            _ => Ok(Box::new(new_openai())),
+        },
+        _ => Err(LLMError::Config(format!("unknown provider '{}'", pname))),
     }
 }

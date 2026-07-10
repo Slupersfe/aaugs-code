@@ -1,17 +1,19 @@
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
+use futures::stream::FuturesUnordered;
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::cost;
-use crate::llm::{ContentBlock, LLMEvent, Message, Role, ToolDef, Usage};
+use crate::llm::{ContentBlock, LLMError, LLMEvent, Message, Role, ToolDef, Usage};
 use crate::llm::LLMProvider;
 use crate::sandbox::{PermissionLevel, Sandbox};
 use crate::tools::{ToolRegistry, ToolResult};
-use crate::tui;
+use crate::term;
 
 const MAX_TURNS: usize = 50;
 const SUMMARY_PREFIX: &str = "[Summary: ";
@@ -67,6 +69,14 @@ impl Session {
         }
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, &content)?;
+        // Restrict permissions: owner read/write only
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("failed to set permissions on session file: {}", e);
+            }
+        }
         Ok(())
     }
 
@@ -85,10 +95,10 @@ impl Session {
             if msg.role == Role::User {
                 for block in &msg.content {
                     if let ContentBlock::Text { text } = block {
-                        let t = text.trim();
-                        let title = if t.len() > 60 {
-                            format!("{}…", &t[..60])
-                        } else {
+                    let t = text.trim();
+                    let title = if t.chars().count() > 60 {
+                        format!("{}…", t.chars().take(60).collect::<String>())
+                    } else {
                             t.to_string()
                         };
                         if !title.is_empty() {
@@ -101,27 +111,43 @@ impl Session {
         }
     }
 
-    pub fn list_sessions() -> anyhow::Result<Vec<(String, String, String)>> {
+    pub fn list_sessions() -> anyhow::Result<Vec<(String, String, String, String)>> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not find home directory"))?;
         let dir = home.join(SESSION_DIR);
         if !dir.exists() {
             return Ok(Vec::new());
         }
         let mut sessions = Vec::new();
+        let now = chrono::Utc::now();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(s) = serde_json::from_str::<Session>(&content) {
+                    // Auto-cleanup sessions older than 30 days
+                    if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&s.created_at) {
+                        let created_utc = created.with_timezone(&chrono::Utc);
+                        let age = now - created_utc;
+                        if age.num_days() > 30 {
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+                    }
                     let display_name = if s.title.is_empty() {
                         s.id.clone()
                     } else {
                         format!("{} ({})", s.title, &s.id[..8])
                     };
-                    sessions.push((s.id, display_name, s.model));
+                    // Truncate created_at to just the date portion
+                    let created = if s.created_at.len() > 10 {
+                        s.created_at[..10].to_string()
+                    } else {
+                        s.created_at.clone()
+                    };
+                    sessions.push((s.id, display_name, s.model, created));
                 }
             }
         }
@@ -351,6 +377,7 @@ pub struct ChatState {
     pub sandbox: Sandbox,
     pub config: Arc<Config>,
     pub model: String,
+    pub auto_route: bool,
     pub max_context_tokens: usize,
     pub max_tool_output_storage: usize,
     pub summarized_count: usize,
@@ -365,6 +392,10 @@ impl ChatState {
         let provider_name = provider.name().to_string();
         let max_context_tokens = config.advanced.max_context_tokens;
         let max_tool_output_storage = config.advanced.max_tool_output_storage;
+        let auto_route = config.provider_config()
+            .and_then(|c| c.auto_route)
+            .unwrap_or(true)
+            && crate::router::is_loaded();
         Self {
             session: Session::new(&model, &provider_name),
             provider,
@@ -372,6 +403,7 @@ impl ChatState {
             sandbox: Sandbox::from_config(&config),
             config,
             model,
+            auto_route,
             max_context_tokens,
             max_tool_output_storage,
             summarized_count: 0,
@@ -380,6 +412,57 @@ impl ChatState {
 
     pub fn set_auto_approve(&mut self, val: bool) {
         self.sandbox.set_auto_approve(val);
+    }
+
+    pub fn auto_route_for_prompt(&mut self, prompt: &str) {
+        let classification = match crate::router::classify(prompt) {
+            Some(c) => c,
+            None => return,
+        };
+        let pc = match self.config.provider_config() {
+            Some(pc) => pc,
+            None => return,
+        };
+        let cats = match pc.model_categories.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+        let model_name = match classification.target.as_str() {
+            "Coding_API" => match classification.intensity.as_str() {
+                "low" => cats.coding.low.clone(),
+                "med" => cats.coding.med.clone(),
+                "high" => cats.coding.high.clone(),
+                "max" => cats.coding.max.clone(),
+                _ => None,
+            },
+            "Analysis_API" => match classification.intensity.as_str() {
+                "low" => cats.analysis.low.clone(),
+                "med" => cats.analysis.med.clone(),
+                "high" => cats.analysis.high.clone(),
+                "max" => cats.analysis.max.clone(),
+                _ => None,
+            },
+            "Creative_API" => match classification.intensity.as_str() {
+                "low" => cats.creative.low.clone(),
+                "med" => cats.creative.med.clone(),
+                "high" => cats.creative.high.clone(),
+                "max" => cats.creative.max.clone(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(chosen) = model_name {
+            if chosen != self.model {
+                self.model = chosen;
+                self.provider.set_model(&self.model);
+                tracing::info!(
+                    target = classification.target, intensity = classification.intensity,
+                    confidence = classification.target_confidence, model = self.model,
+                    latency_ms = classification.latency_ms,
+                    "auto-routed",
+                );
+            }
+        }
     }
 }
 
@@ -406,14 +489,14 @@ trait TurnOutput {
 }
 
 struct StdoutOutput {
-    stream_printer: tui::StreamPrinter,
+    stream_printer: term::StreamPrinter,
     has_streamed_text: bool,
 }
 
 impl StdoutOutput {
     fn new() -> Self {
         Self {
-            stream_printer: tui::StreamPrinter::new(),
+            stream_printer: term::StreamPrinter::new(),
             has_streamed_text: false,
         }
     }
@@ -431,27 +514,27 @@ impl TurnOutput for StdoutOutput {
         if self.has_streamed_text {
             self.stream_printer.finish(assistant_text);
         } else if !assistant_text.is_empty() {
-            tui::render_markdown(assistant_text);
+            term::render_markdown(assistant_text);
         }
         Ok(())
     }
     fn on_tool_exec(&mut self, name: &str, args: &Value) {
-        tui::print_tool_header(name, args);
+        term::print_tool_header(name, args);
     }
     fn on_tool_result(&mut self, _name: &str, output: &str) {
-        tui::print_tool_result(output);
+        term::print_tool_result(output);
     }
     fn on_tool_denied(&mut self, name: &str) {
-        tui::print_tool_denied(name);
+        term::print_tool_denied(name);
     }
     fn on_done(&mut self) {
-        tui::print_success();
+        term::print_success();
     }
     fn on_turn_done(&mut self) {
         println!();
     }
     fn on_info(&mut self, msg: &str) {
-        tui::print_info(msg);
+        term::print_info(msg);
     }
     fn on_error(&mut self, _err: &str) {}
     async fn request_permission(&mut self, sandbox: &Sandbox, name: &str, description: &str) -> bool {
@@ -465,12 +548,12 @@ impl TurnOutput for StdoutOutput {
 }
 
 struct TuiOutput {
-    event_tx: std::sync::mpsc::Sender<crate::tui_app::AppEvent>,
+    event_tx: std::sync::mpsc::Sender<crate::tui::AppEvent>,
     has_streamed_text: bool,
 }
 
 impl TuiOutput {
-    fn new(event_tx: std::sync::mpsc::Sender<crate::tui_app::AppEvent>) -> Self {
+    fn new(event_tx: std::sync::mpsc::Sender<crate::tui::AppEvent>) -> Self {
         Self { event_tx, has_streamed_text: false }
     }
 }
@@ -479,11 +562,11 @@ impl TuiOutput {
 impl TurnOutput for TuiOutput {
     fn start_turn(&mut self) {}
     fn on_text(&mut self, text: &str) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::Text(text.to_string()));
+        let _ = self.event_tx.send(crate::tui::AppEvent::Text(text.to_string()));
         self.has_streamed_text = true;
     }
     fn on_tool_call(&mut self, name: &str, args: &Value) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::ToolCall {
+        let _ = self.event_tx.send(crate::tui::AppEvent::ToolCall {
             name: name.to_string(),
             args: args.to_string(),
         });
@@ -492,34 +575,36 @@ impl TurnOutput for TuiOutput {
         Ok(())
     }
     fn on_tool_exec(&mut self, name: &str, args: &Value) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::ToolCall {
+        let _ = self.event_tx.send(crate::tui::AppEvent::ToolCall {
             name: name.to_string(),
             args: args.to_string(),
         });
     }
     fn on_tool_result(&mut self, name: &str, output: &str) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::ToolResult {
+        let _ = self.event_tx.send(crate::tui::AppEvent::ToolResult {
             name: name.to_string(),
             output: output.to_string(),
         });
     }
     fn on_tool_denied(&mut self, name: &str) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::ToolDenied {
+        let _ = self.event_tx.send(crate::tui::AppEvent::ToolDenied {
             name: name.to_string(),
         });
     }
-    fn on_done(&mut self) {}
+    fn on_done(&mut self) {
+        let _ = self.event_tx.send(crate::tui::AppEvent::TurnDone);
+    }
     fn on_turn_done(&mut self) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::TurnDone);
+        let _ = self.event_tx.send(crate::tui::AppEvent::TurnDone);
     }
     fn on_info(&mut self, msg: &str) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::Info(msg.to_string()));
+        let _ = self.event_tx.send(crate::tui::AppEvent::Info(msg.to_string()));
     }
     fn on_error(&mut self, err: &str) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::Error(err.to_string()));
+        let _ = self.event_tx.send(crate::tui::AppEvent::Error(err.to_string()));
     }
     fn on_usage(&mut self, prompt_tokens: u32, completion_tokens: u32, cost: f64) {
-        let _ = self.event_tx.send(crate::tui_app::AppEvent::Usage {
+        let _ = self.event_tx.send(crate::tui::AppEvent::Usage {
             prompt_tokens,
             completion_tokens,
             cost,
@@ -531,7 +616,7 @@ impl TurnOutput for TuiOutput {
             PermissionLevel::Deny => false,
             PermissionLevel::Ask => {
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                let _ = self.event_tx.send(crate::tui_app::AppEvent::Question {
+                let _ = self.event_tx.send(crate::tui::AppEvent::Question {
                     question: format!("Allow tool '{}': {}?", tool_name, description),
                     options: vec!["y".to_string(), "n".to_string()],
                     tx: resp_tx,
@@ -642,6 +727,16 @@ async fn process_turn_inner<O: TurnOutput>(
         }
         turn_count += 1;
 
+        // Check cost budget before each turn
+        let budget = state.config.advanced.max_cost_per_session;
+        if budget > 0.0 && state.session.total_cost >= budget {
+            output.on_info(&format!(
+                "Cost budget reached (${:.4} / ${:.4}). Ending session.",
+                state.session.total_cost, budget
+            ));
+            return Ok(true);
+        }
+
         drop_stale_tool_results(&mut state.session.messages, 10);
         strip_tool_call_inputs(&mut state.session.messages);
         coalesce_text_blocks(&mut state.session.messages);
@@ -653,7 +748,8 @@ async fn process_turn_inner<O: TurnOutput>(
 
         output.start_turn();
 
-        let mut stream = match state.provider.stream_chat(&state.session.messages, &tools).await {
+        // Try primary model with retry, then fallbacks
+        let mut stream = match try_stream_with_fallback(state, &tools).await {
             Ok(s) => s,
             Err(e) => {
                 output.on_error(&format!("LLM error: {}", e));
@@ -751,34 +847,123 @@ async fn process_turn_inner<O: TurnOutput>(
         }
 
         output.on_turn_done();
-        for (id, name, args) in &tool_calls {
-            output.on_tool_exec(name, args);
 
+        // Parallel tool execution with FuturesUnordered
+        if tool_calls.len() == 1 {
+            let (id, name, args) = tool_calls.into_iter().next().unwrap();
             let description = format!("{}({})", name, args);
-            let approved = output.request_permission(&state.sandbox, name, &description).await;
-
+            let approved = output.request_permission(&state.sandbox, &name, &description).await;
             if !approved {
-                output.on_tool_denied(name);
+                output.on_tool_denied(&name);
                 state.session.messages.push(Message::tool_result(id, format!("tool '{}' was denied", name)));
-                continue;
+            } else {
+                let result = state.registry.execute(&name, args).await;
+                let output_text = format_result(&result);
+                let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
+                output.on_tool_result(&name, &output_text);
+                state.session.messages.push(Message::tool_result(id, stored_text));
+            }
+        } else {
+            // Permission checks are sequential (user interaction)
+            let mut approved = Vec::new();
+            for (id, name, args) in &tool_calls {
+                output.on_tool_exec(name, args);
+                let description = format!("{}({})", name, args);
+                let granted = output.request_permission(&state.sandbox, name, &description).await;
+                if granted {
+                    approved.push((id.clone(), name.clone(), args.clone()));
+                } else {
+                    output.on_tool_denied(name);
+                    state.session.messages.push(Message::tool_result(id.clone(), format!("tool '{}' was denied", name)));
+                }
+            }
+            // Execute approved tools in parallel
+            if !approved.is_empty() {
+                let registry = &state.registry;
+                let mut tasks = FuturesUnordered::new();
+                for (id, name, args) in approved {
+                    tasks.push(async move {
+                        let result = registry.execute(&name, args).await;
+                        (id, name, result)
+                    });
+                }
+                while let Some((id, name, result)) = tasks.next().await {
+                    let output_text = format_result(&result);
+                    let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
+                    output.on_tool_result(&name, &output_text);
+                    state.session.messages.push(Message::tool_result(id, stored_text));
+                }
+            }
+        }
+    }
+}
+
+/// Tries the primary provider with retry, then attempts fallback providers on failure.
+/// When a fallback succeeds, `state.provider`, `state.model`, and `state.session.provider_name` are updated.
+async fn try_stream_with_fallback(
+    state: &mut ChatState,
+    tools: &[ToolDef],
+) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<LLMEvent, LLMError>> + Send>>> {
+    let primary_result = crate::llm::retry_with_backoff(
+        || state.provider.stream_chat(&state.session.messages, tools),
+        2,
+    ).await;
+
+    match primary_result {
+        Ok(stream) => return Ok(stream),
+        Err(primary_err) => {
+            let fallbacks = state.config.provider_config()
+                .map(|c| c.fallback.clone())
+                .unwrap_or_default();
+
+            if fallbacks.is_empty() {
+                return Err(anyhow::anyhow!("{}", primary_err));
             }
 
-            let result = state.registry.execute(name, args.clone()).await;
-            let output_text = format_result(&result);
-            let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
-
-            output.on_tool_result(name, &output_text);
-            state.session.messages.push(Message::tool_result(id, stored_text));
+            let mut last_err = primary_err;
+            for entry in &fallbacks {
+                let (provider_name, model) = match entry.split_once(':') {
+                    Some((p, m)) => (p, m),
+                    None => continue,
+                };
+                let mut cfg = (*state.config).clone();
+                cfg.provider = provider_name.to_string();
+                let mut new_provider = match crate::llm::resolve_provider(&cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("fallback provider '{}' failed to resolve: {}", provider_name, e);
+                        continue;
+                    }
+                };
+                new_provider.set_model(model);
+                match crate::llm::retry_with_backoff(
+                    || new_provider.stream_chat(&state.session.messages, tools),
+                    1,
+                ).await {
+                    Ok(stream) => {
+                        tracing::info!("fell back to {}:{}", provider_name, model);
+                        state.provider = new_provider;
+                        state.model = model.to_string();
+                        state.session.provider_name = provider_name.to_string();
+                        return Ok(stream);
+                    }
+                    Err(e) => {
+                        tracing::warn!("fallback {}:{} failed: {}", provider_name, model, e);
+                        last_err = e;
+                    }
+                }
+            }
+            Err(anyhow::anyhow!("{}", last_err))
         }
     }
 }
 
 pub async fn process_turn(state: &mut ChatState) -> anyhow::Result<bool> {
-    let spinner = tui::start_spinner();
+    let spinner = term::start_spinner();
     let mut output = StdoutOutput::new();
     let result = process_turn_inner(state, &mut output).await;
     spinner.store(false, std::sync::atomic::Ordering::Relaxed);
-    tui::clear_line();
+    term::clear_line();
     result
 }
 
@@ -802,6 +987,9 @@ fn add_system_prompt(state: &mut ChatState) {
 
 pub async fn run_once(state: &mut ChatState, prompt: &str) -> anyhow::Result<()> {
     add_system_prompt(state);
+    if state.auto_route {
+        state.auto_route_for_prompt(prompt);
+    }
     state.session.messages.push(Message::user(prompt));
     state.session.auto_title();
     process_turn(state).await?;
@@ -818,7 +1006,7 @@ pub async fn run_once(state: &mut ChatState, prompt: &str) -> anyhow::Result<()>
 
 pub async fn process_turn_tui(
     state: &mut ChatState,
-    event_tx: &std::sync::mpsc::Sender<crate::tui_app::AppEvent>,
+    event_tx: &std::sync::mpsc::Sender<crate::tui::AppEvent>,
 ) -> anyhow::Result<bool> {
     let mut output = TuiOutput::new(event_tx.clone());
     process_turn_inner(state, &mut output).await
@@ -832,9 +1020,9 @@ enum SlashResultTui {
 async fn handle_slash_command_tui(
     state: &mut ChatState,
     input: &str,
-    event_tx: &std::sync::mpsc::Sender<crate::tui_app::AppEvent>,
+    event_tx: &std::sync::mpsc::Sender<crate::tui::AppEvent>,
 ) -> anyhow::Result<SlashResultTui> {
-    use crate::tui_app::AppEvent;
+    use crate::tui::AppEvent;
 
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -844,28 +1032,56 @@ async fn handle_slash_command_tui(
         "/exit" | "/quit" => Ok(SlashResultTui::Exit),
         "/help" => {
             let _ = event_tx.send(AppEvent::Info(
-                "Available: /exit, /clear, /model, /tokens, /summarize, /provider, /browse, /sessions, /resume, /update\nPress Tab/F1 for full help screen.".into()
+                "Available: /exit, /clear, /model, /tokens, /summarize, /provider, /browse, /sessions, /search, /resume, /update\nPress Tab/F1 for full help screen.".into()
             ));
             Ok(SlashResultTui::Continue)
         }
         "/clear" => {
-            let system = state.session.messages.iter()
-                .find(|m| matches!(m.role, Role::System))
-                .cloned();
-            state.session.messages.clear();
-            if let Some(s) = system {
-                state.session.messages.push(s);
-            }
-            let _ = event_tx.send(AppEvent::Info("Conversation cleared".into()));
+            let _ = event_tx.send(AppEvent::Clear);
             Ok(SlashResultTui::Continue)
         }
         "/model" => {
             if arg.is_empty() {
                 let _ = event_tx.send(AppEvent::OpenBrowse);
+            } else if arg == "auto" {
+                state.auto_route = true;
+                let _ = event_tx.send(AppEvent::AutoRoute(true));
+                let _ = event_tx.send(AppEvent::Info("Auto-routing enabled (ONNX router)".into()));
+            } else if let Some((cat, tier)) = arg.split_once(':') {
+                let resolved = state.config.provider_config().and_then(|c| c.model_categories.as_ref()).and_then(|cats| {
+                    let cm = match cat.to_lowercase().as_str() {
+                        "coding" => Some(&cats.coding),
+                        "analysis" => Some(&cats.analysis),
+                        "creative" => Some(&cats.creative),
+                        _ => None,
+                    }?;
+                    match tier.to_lowercase().as_str() {
+                        "low" => cm.low.clone(),
+                        "med" => cm.med.clone(),
+                        "high" => cm.high.clone(),
+                        "max" => cm.max.clone(),
+                        _ => None,
+                    }
+                });
+                match resolved {
+                    Some(m) => {
+                        state.auto_route = false;
+                        state.model = m.clone();
+                        state.provider.set_model(&m);
+                        let _ = event_tx.send(AppEvent::ModelChanged(state.model.clone()));
+                        let _ = event_tx.send(AppEvent::AutoRoute(false));
+                        let _ = event_tx.send(AppEvent::Info(format!("Model changed to: {}", m)));
+                    }
+                    None => {
+                        let _ = event_tx.send(AppEvent::Error(format!("Unknown category:tier '{}'", arg)));
+                    }
+                }
             } else {
+                state.auto_route = false;
                 state.model = arg.to_string();
                 state.provider.set_model(&state.model);
                 let _ = event_tx.send(AppEvent::ModelChanged(state.model.clone()));
+                let _ = event_tx.send(AppEvent::AutoRoute(false));
                 let _ = event_tx.send(AppEvent::Info(format!("Model changed to: {}", state.model)));
             }
             Ok(SlashResultTui::Continue)
@@ -978,14 +1194,31 @@ async fn handle_slash_command_tui(
                         let _ = event_tx.send(AppEvent::Info("No saved sessions".into()));
                     } else {
                         let mut info = String::from("Sessions (use /resume <id>):");
-                        for (_id, display_name, model) in &sessions {
-                            info.push_str(&format!("\n  {} — {}", display_name, model));
+                        for (_id, display_name, model, created) in &sessions {
+                            info.push_str(&format!("\n  {}  — {}  ({})", display_name, model, created));
                         }
                         let _ = event_tx.send(AppEvent::Info(info));
                     }
                 }
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::Error(format!("Failed to list sessions: {}", e)));
+                }
+            }
+            Ok(SlashResultTui::Continue)
+        }
+        "/search" => {
+            if arg.is_empty() {
+                let _ = event_tx.send(AppEvent::Info("Usage: /search <query> — full-text search across sessions".into()));
+            } else {
+                let results = search_sessions(arg);
+                if results.is_empty() {
+                    let _ = event_tx.send(AppEvent::Info(format!("No sessions matched: {}", arg)));
+                } else {
+                    let mut info = format!("Sessions matching '{}':", arg);
+                    for (display_name, snippet) in &results {
+                        info.push_str(&format!("\n  {}  — …{}…", display_name, snippet));
+                    }
+                    let _ = event_tx.send(AppEvent::Info(info));
                 }
             }
             Ok(SlashResultTui::Continue)
@@ -1032,7 +1265,7 @@ async fn handle_slash_command_tui(
 }
 
 pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u32>) -> anyhow::Result<()> {
-    use crate::tui_app::{self, TuiApp, AppEvent};
+    use crate::tui::{self, TuiApp, AppEvent};
 
     add_system_prompt(&mut state);
 
@@ -1042,10 +1275,10 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
     let model = state.model.clone();
     let provider_name = state.provider.name().to_string();
     let preferred_models = state.config.provider_config()
-        .map(|c| c.preferred_models.clone())
+        .map(|c| c.effective_models())
         .unwrap_or_default();
 
-    let mut app = TuiApp::new(&model, &provider_name, event_rx, latest_release, &preferred_models);
+    let mut app = TuiApp::new(&model, &provider_name, state.auto_route, event_rx, latest_release, &preferred_models);
 
     if let Some(ver) = latest_release {
         let _ = event_tx.send(AppEvent::UpdateAvailable(ver));
@@ -1060,6 +1293,10 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
                     SlashResultTui::Exit => break,
                     SlashResultTui::Continue => continue,
                 }
+            }
+
+            if state.auto_route {
+                state.auto_route_for_prompt(&input);
             }
 
             state.session.messages.push(Message::user(&input));
@@ -1085,7 +1322,7 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
         )?;
         terminal.clear()?;
-        let result = tui_app::run_tui(&mut app, &mut terminal, &tui_input_tx);
+        let result = tui::run_tui(&mut app, &mut terminal, &tui_input_tx);
         crossterm::terminal::disable_raw_mode()?;
         result
     });
@@ -1113,6 +1350,78 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
     proc_result?;
 
     Ok(())
+}
+
+/// Full-text search across all session files.
+fn search_sessions(query: &str) -> Vec<(String, String)> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let dir = home.join(SESSION_DIR);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+    let now = chrono::Utc::now();
+    for entry in std::fs::read_dir(dir).ok().into_iter().flatten() {
+        let entry = match entry {
+            Ok(e) => e,
+            _ => continue,
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            _ => continue,
+        };
+        if !content.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+        let session: Session = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            _ => continue,
+        };
+        // Skip expired sessions
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&session.created_at) {
+            let created_utc = created.with_timezone(&chrono::Utc);
+            let age = now - created_utc;
+            if age.num_days() > 30 {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        }
+        let display_name = if session.title.is_empty() {
+            session.id[..8].to_string()
+        } else {
+            format!("{} ({})", session.title, &session.id[..8])
+        };
+        // Find a matching snippet
+        let snippet = session.messages.iter()
+            .filter_map(|m| {
+                for block in &m.content {
+                    if let ContentBlock::Text { text } = block {
+                        if let Some(pos) = text.to_lowercase().find(&query_lower) {
+                            let start = pos.saturating_sub(40);
+                            let end = (pos + query.len() + 40).min(text.len());
+                            let snippet = if start > 0 { "…" } else { "" }.to_string()
+                                + &text[start..end]
+                                + if end < text.len() { "…" } else { "" };
+                            return Some(snippet);
+                        }
+                    }
+                }
+                None
+            })
+            .next()
+            .unwrap_or_default();
+        results.push((display_name, snippet));
+    }
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    results
 }
 
 #[cfg(test)]

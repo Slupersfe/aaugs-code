@@ -76,11 +76,11 @@ impl Tool for BashTool {
                 let mut result = String::new();
 
                 if !output.stdout.is_empty() {
-                    if !result.is_empty() { result.push_str("\n"); }
+                    if !result.is_empty() { result.push('\n'); }
                     result.push_str(&String::from_utf8_lossy(&output.stdout));
                 }
                 if !output.stderr.is_empty() {
-                    if !result.is_empty() { result.push_str("\n"); }
+                    if !result.is_empty() { result.push('\n'); }
                     result.push_str(&String::from_utf8_lossy(&output.stderr));
                 }
 

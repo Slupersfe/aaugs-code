@@ -12,7 +12,7 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new file with the given content. Fails if the file already exists."
+        "Write content to a file, creating parent directories if needed. Overwrites if the file already exists."
     }
 
     fn parameters(&self) -> Value {

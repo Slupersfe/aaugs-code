@@ -12,9 +12,6 @@ pub struct Cli {
     #[arg(short, long, help = "Path to config file")]
     pub config: Option<String>,
 
-    #[arg(short = 'C', long, help = "Resume last session")]
-    pub continue_session: bool,
-
     #[arg(short = 'y', long, help = "Auto-approve all tool permissions")]
     pub yes: bool,
 }
@@ -27,4 +24,19 @@ pub enum Commands {
     },
     #[command(about = "Initialize interactive config setup")]
     Init,
+    #[command(about = "Manage sessions")]
+    Session {
+        #[command(subcommand)]
+        action: SessionCommands,
+    },
+}
+
+#[derive(Parser)]
+pub enum SessionCommands {
+    #[command(about = "List all saved sessions")]
+    Ls,
+    #[command(about = "Remove a saved session by ID")]
+    Rm {
+        id: String,
+    },
 }

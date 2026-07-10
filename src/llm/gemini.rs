@@ -5,7 +5,6 @@ use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tracing;
 
 use super::{
     LLMError, LLMEvent, LLMProvider, Message, ToolDef, read_sse_stream,
@@ -20,6 +19,9 @@ pub struct GeminiProvider {
     api_key: String,
     model: String,
     base_url: String,
+    max_tokens: u32,
+    temperature: f32,
+    provider_name: String,
 }
 
 #[derive(Serialize)]
@@ -29,6 +31,16 @@ struct GeminiRequest {
     contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<GeminiTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>,
+}
+
+#[derive(Serialize)]
+struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -75,18 +87,21 @@ struct GeminiFunctionDeclaration {
 }
 
 impl GeminiProvider {
-    pub fn new(cfg: &ProviderConfig) -> Self {
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
         Self {
             client: Client::new(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
             base_url: cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            max_tokens,
+            temperature,
+            provider_name: provider_name.to_string(),
         }
     }
 
     fn model_path(&self) -> String {
         let model = if self.model.contains('/') {
-            self.model.split('/').last().unwrap_or(&self.model)
+            self.model.split('/').next_back().unwrap_or(&self.model)
         } else {
             &self.model
         };
@@ -100,6 +115,7 @@ impl GeminiProvider {
     fn convert_messages(&self, messages: &[Message]) -> (Option<SystemInstruction>, Vec<GeminiContent>) {
         let mut system: Option<SystemInstruction> = None;
         let mut contents = Vec::new();
+        let mut tool_name_for_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         for msg in messages {
             match msg.role {
@@ -154,13 +170,24 @@ impl GeminiProvider {
                     }
                 }
                 Role::Tool => {
+                    // Build mapping from tool_use_id -> name by scanning assistant messages first
+                    for m in messages {
+                        if m.role == Role::Assistant {
+                            for block in &m.content {
+                                if let ContentBlock::ToolUse { id, name, .. } = block {
+                                    tool_name_for_id.entry(id.clone()).or_insert_with(|| name.clone());
+                                }
+                            }
+                        }
+                    }
                     let parts: Vec<Part> = msg.content.iter().filter_map(|block| {
-                        if let ContentBlock::ToolResult { tool_use_id: _, content } = block {
-                            // For Gemini, we need the function name from the context
-                            // We'll use a generic "unknown" fallback
+                        if let ContentBlock::ToolResult { tool_use_id, content } = block {
+                            let name = tool_name_for_id.get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
                             Some(Part::FunctionResponse {
                                 function_response: FunctionResponse {
-                                    name: "unknown".to_string(),
+                                    name,
                                     response: json!({"result": content}),
                                 },
                             })
@@ -197,7 +224,7 @@ impl GeminiProvider {
 #[async_trait]
 impl LLMProvider for GeminiProvider {
     fn name(&self) -> &str {
-        "gemini"
+        &self.provider_name
     }
 
     fn default_model(&self) -> &str {
@@ -220,6 +247,10 @@ impl LLMProvider for GeminiProvider {
             system_instruction: system,
             contents,
             tools: api_tools,
+            generation_config: Some(GenerationConfig {
+                max_output_tokens: Some(self.max_tokens),
+                temperature: Some(self.temperature),
+            }),
         };
 
         let url = format!(

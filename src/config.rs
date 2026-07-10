@@ -4,6 +4,35 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCategories {
+    pub coding: CategoryModels,
+    pub analysis: CategoryModels,
+    pub creative: CategoryModels,
+}
+
+impl ModelCategories {
+    /// Returns a flat list of all non-empty model IDs across all categories/tiers.
+    pub fn flatten(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        for m in [&self.coding, &self.analysis, &self.creative] {
+            if let Some(ref id) = m.low { v.push(id.clone()); }
+            if let Some(ref id) = m.med { v.push(id.clone()); }
+            if let Some(ref id) = m.high { v.push(id.clone()); }
+            if let Some(ref id) = m.max { v.push(id.clone()); }
+        }
+        v
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryModels {
+    pub low: Option<String>,
+    pub med: Option<String>,
+    pub high: Option<String>,
+    pub max: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub provider: String,
@@ -18,6 +47,8 @@ pub struct Config {
     #[serde(default)]
     pub opencode: Option<ProviderConfig>,
     #[serde(default)]
+    pub custom: Option<ProviderConfig>,
+    #[serde(default)]
     pub advanced: AdvancedConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
@@ -30,9 +61,46 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub auto_route: Option<bool>,
+    #[serde(default)]
+    pub router_model_path: Option<String>,
+    #[serde(default)]
+    pub model_categories: Option<ModelCategories>,
+    /// Kept for backward compatibility — newer configs use `model_categories`.
+    #[serde(default)]
     pub preferred_models: Vec<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub fallback: Vec<String>,
+}
+
+impl ProviderConfig {
+    /// Returns the effective model IDs: model_categories first, then preferred_models.
+    pub fn effective_models(&self) -> Vec<String> {
+        if let Some(ref cats) = self.model_categories {
+            let flat = cats.flatten();
+            if !flat.is_empty() {
+                return flat;
+            }
+        }
+        self.preferred_models.clone()
+    }
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: String::new(),
+            auto_route: None,
+            router_model_path: None,
+            preferred_models: Vec::new(),
+            model_categories: None,
+            base_url: None,
+            fallback: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +117,8 @@ pub struct AdvancedConfig {
     pub max_context_tokens: usize,
     #[serde(default = "default_max_tool_output_storage")]
     pub max_tool_output_storage: usize,
+    #[serde(default = "default_max_cost_per_session")]
+    pub max_cost_per_session: f64,
     pub proxy: Option<String>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderOverride>,
@@ -98,6 +168,10 @@ fn default_max_tool_output_storage() -> usize {
     4000
 }
 
+fn default_max_cost_per_session() -> f64 {
+    0.0
+}
+
 fn default_permission() -> String {
     "ask".to_string()
 }
@@ -111,6 +185,7 @@ impl Default for AdvancedConfig {
             timeout_secs: default_timeout(),
             max_context_tokens: default_max_context_tokens(),
             max_tool_output_storage: default_max_tool_output_storage(),
+            max_cost_per_session: default_max_cost_per_session(),
             proxy: None,
             providers: HashMap::new(),
         }
@@ -136,33 +211,54 @@ impl Default for Config {
             openrouter: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "anthropic/claude-sonnet-4".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                fallback: Vec::new(),
             }),
             anthropic: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "claude-sonnet-4-20250514".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: None,
+                fallback: Vec::new(),
             }),
             openai: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "gpt-4o".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
+                fallback: Vec::new(),
             }),
             gemini: Some(ProviderConfig {
                 api_key: String::new(),
                 model: "gemini-2.5-pro".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: None,
+                fallback: Vec::new(),
             }),
             opencode: Some(ProviderConfig {
                 api_key: "public".to_string(),
                 model: "big-pickle".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: Some("https://opencode.ai/zen/v1".to_string()),
+                fallback: Vec::new(),
             }),
+            custom: None,
             advanced: AdvancedConfig::default(),
             permissions: PermissionsConfig::default(),
         }
@@ -186,7 +282,7 @@ impl Config {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         let provider = self.provider.as_str();
-        let valid_formats = ["auto", "openai", "anthropic", "google"];
+        let valid_formats = ["auto", "openai", "anthropic", "google", "gemini"];
         if !valid_formats.contains(&self.advanced.api_format.as_str()) {
             anyhow::bail!(
                 "invalid api_format '{}' — must be one of: auto, openai, anthropic, google",
@@ -199,6 +295,7 @@ impl Config {
             "openai" => self.openai.is_some(),
             "gemini" => self.gemini.is_some(),
             "opencode" => self.opencode.is_some(),
+            "custom" => self.custom.is_some(),
             _ => false,
         };
         if !has_provider {
@@ -218,6 +315,7 @@ impl Config {
             "openai" => self.openai.as_ref(),
             "gemini" => self.gemini.as_ref(),
             "opencode" => self.opencode.as_ref(),
+            "custom" => self.custom.as_ref(),
             _ => None,
         }
     }
@@ -242,8 +340,12 @@ mod tests {
             openai: Some(ProviderConfig {
                 api_key: "sk-test".to_string(),
                 model: "gpt-4o".to_string(),
+                auto_route: None,
+                router_model_path: None,
                 preferred_models: Vec::new(),
+                model_categories: None,
                 base_url: None,
+                fallback: Vec::new(),
             }),
             ..Config::default()
         }
