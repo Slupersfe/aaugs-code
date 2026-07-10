@@ -119,6 +119,10 @@ pub struct AdvancedConfig {
     pub max_tool_output_storage: usize,
     #[serde(default = "default_max_cost_per_session")]
     pub max_cost_per_session: f64,
+    #[serde(default = "default_output_truncation_chars")]
+    pub tool_output_truncation_chars: usize,
+    #[serde(default = "default_result_truncation_bytes")]
+    pub tool_result_truncation_bytes: usize,
     pub proxy: Option<String>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderOverride>,
@@ -172,6 +176,14 @@ fn default_max_cost_per_session() -> f64 {
     0.0
 }
 
+fn default_output_truncation_chars() -> usize {
+    200
+}
+
+fn default_result_truncation_bytes() -> usize {
+    2000
+}
+
 fn default_permission() -> String {
     "ask".to_string()
 }
@@ -186,6 +198,8 @@ impl Default for AdvancedConfig {
             max_context_tokens: default_max_context_tokens(),
             max_tool_output_storage: default_max_tool_output_storage(),
             max_cost_per_session: default_max_cost_per_session(),
+            tool_output_truncation_chars: default_output_truncation_chars(),
+            tool_result_truncation_bytes: default_result_truncation_bytes(),
             proxy: None,
             providers: HashMap::new(),
         }
