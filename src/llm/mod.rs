@@ -210,8 +210,8 @@ pub async fn read_sse_stream(
 }
 
 /// Retries an async fallible operation with exponential backoff.
-/// Retries on HTTP 429 (rate limit) and 5xx (server errors) up to `max_retries` times.
-/// Non-retryable errors are returned immediately.
+/// Retries on HTTP 429 (rate limit), 5xx (server errors), and transient 400s (upstream failures)
+/// up to `max_retries` times. Non-retryable errors are returned immediately.
 pub async fn retry_with_backoff<F, Fut, T>(f: F, max_retries: u32) -> Result<T, LLMError>
 where
     F: Fn() -> Fut,
@@ -220,6 +220,13 @@ where
     for attempt in 0..=max_retries {
         match f().await {
             Ok(val) => return Ok(val),
+            Err(LLMError::Http { status, body }) if status.as_u16() == 400 && body.contains("Upstream request failed") => {
+                if attempt == max_retries {
+                    return Err(LLMError::Http { status: status.clone(), body: body.clone() });
+                }
+                let wait_ms = 1000u64 * 2u64.pow(attempt);
+                tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
+            }
             Err(LLMError::Http { status, body }) if status.as_u16() == 429 || status.as_u16() >= 500 => {
                 if attempt == max_retries {
                     return Err(LLMError::Http { status: status.clone(), body: body.clone() });

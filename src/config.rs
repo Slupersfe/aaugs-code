@@ -177,11 +177,11 @@ fn default_max_cost_per_session() -> f64 {
 }
 
 fn default_output_truncation_chars() -> usize {
-    200
+    500
 }
 
 fn default_result_truncation_bytes() -> usize {
-    2000
+    10000
 }
 
 fn default_permission() -> String {

@@ -22,6 +22,11 @@ impl Tool for GlobTool {
                 "pattern": {
                     "type": "string",
                     "description": "The glob pattern to search for"
+                },
+                "max_output": {
+                    "type": "integer",
+                    "description": "Maximum bytes in the result sent to the model. Use a high value (e.g. 100000) to get full output without truncation.",
+                    "minimum": 1
                 }
             },
             "required": ["pattern"]

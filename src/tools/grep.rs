@@ -26,6 +26,11 @@ impl Tool for GrepTool {
                 "include": {
                     "type": "string",
                     "description": "Optional glob pattern to filter files (e.g. '*.rs', 'src/**/*.ts')"
+                },
+                "max_output": {
+                    "type": "integer",
+                    "description": "Maximum bytes in the result sent to the model. Use a high value (e.g. 100000) to get full output without truncation.",
+                    "minimum": 1
                 }
             },
             "required": ["pattern"]

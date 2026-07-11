@@ -863,6 +863,10 @@ async fn process_turn_inner<O: TurnOutput>(
 
         output.on_turn_done();
 
+        let max_output_from_args = |args: &Value| -> Option<usize> {
+            args.get("max_output").and_then(|v| v.as_u64()).map(|v| v as usize)
+        };
+
         // Parallel tool execution with FuturesUnordered
         if tool_calls.len() == 1 {
             let (id, name, args) = tool_calls.into_iter().next().unwrap();
@@ -872,21 +876,24 @@ async fn process_turn_inner<O: TurnOutput>(
                 output.on_tool_denied(&name);
                 state.session.messages.push(Message::tool_result(id, format!("tool '{}' was denied", name)));
             } else {
+                let custom_max = max_output_from_args(&args);
                 let result = state.registry.execute(&name, args).await;
-                let output_text = format_result(&result, state.max_tool_result_truncation);
+                let max_bytes = custom_max.unwrap_or(state.max_tool_result_truncation);
+                let output_text = format_result(&result, max_bytes);
                 let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
                 output.on_tool_result(&name, &output_text);
                 state.session.messages.push(Message::tool_result(id, stored_text));
             }
         } else {
             // Permission checks are sequential (user interaction)
-            let mut approved = Vec::new();
+            let mut approved: Vec<(String, String, Value, Option<usize>)> = Vec::new();
             for (id, name, args) in &tool_calls {
                 output.on_tool_exec(name, args);
                 let description = format!("{}({})", name, args);
                 let granted = output.request_permission(&state.sandbox, name, &description).await;
                 if granted {
-                    approved.push((id.clone(), name.clone(), args.clone()));
+                    let custom_max = max_output_from_args(args);
+                    approved.push((id.clone(), name.clone(), args.clone(), custom_max));
                 } else {
                     output.on_tool_denied(name);
                     state.session.messages.push(Message::tool_result(id.clone(), format!("tool '{}' was denied", name)));
@@ -896,14 +903,15 @@ async fn process_turn_inner<O: TurnOutput>(
             if !approved.is_empty() {
                 let registry = &state.registry;
                 let mut tasks = FuturesUnordered::new();
-                for (id, name, args) in approved {
+                for (id, name, args, custom_max) in approved {
                     tasks.push(async move {
                         let result = registry.execute(&name, args).await;
-                        (id, name, result)
+                        (id, name, result, custom_max)
                     });
                 }
-                while let Some((id, name, result)) = tasks.next().await {
-                    let output_text = format_result(&result, state.max_tool_result_truncation);
+                while let Some((id, name, result, custom_max)) = tasks.next().await {
+                    let max_bytes = custom_max.unwrap_or(state.max_tool_result_truncation);
+                    let output_text = format_result(&result, max_bytes);
                     let stored_text = truncate_for_storage(&result.output, state.max_tool_output_storage);
                     output.on_tool_result(&name, &output_text);
                     state.session.messages.push(Message::tool_result(id, stored_text));
