@@ -184,10 +184,12 @@ impl AnthropicProvider {
             .with_timeout(Duration::from_secs(timeout_secs));
         let client = Anthropic::with_config(config)
             .map_err(|e| LLMError::Config(e.to_string()))?;
+        // Anthropic requires max_tokens >= 1; 0 means no limit, so use a large default
+        let effective_max = if max_tokens == 0 { 8192 } else { max_tokens };
         Ok(Self {
             client,
             model: cfg.model.clone(),
-            max_tokens,
+            max_tokens: effective_max,
             temperature,
             provider_name: provider_name.to_string(),
         })

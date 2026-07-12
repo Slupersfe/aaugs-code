@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match &cli.command {
-        Some(Commands::Init) => {
-            init::run(&config_path)?;
+        Some(Commands::Init(args)) => {
+            init::run(&config_path, args)?;
             return Ok(());
         }
         Some(Commands::Session { action }) => {

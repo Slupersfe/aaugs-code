@@ -169,7 +169,7 @@ fn default_api_format() -> String {
 }
 
 fn default_max_tokens() -> u32 {
-    4096
+    0
 }
 
 fn default_temperature() -> f32 {
@@ -344,8 +344,8 @@ impl Config {
             }
         }
         let adv = &self.advanced;
-        if adv.max_tokens == 0 || adv.max_tokens > 1_000_000 {
-            anyhow::bail!("max_tokens must be between 1 and 1,000,000");
+        if adv.max_tokens > 1_000_000 {
+            anyhow::bail!("max_tokens must be between 0 and 1,000,000");
         }
         if !(0.0..=2.0).contains(&adv.temperature) {
             anyhow::bail!("temperature must be between 0.0 and 2.0");

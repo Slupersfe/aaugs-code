@@ -22,13 +22,34 @@ pub enum Commands {
     Run {
         prompt: String,
     },
-    #[command(about = "Initialize interactive config setup")]
-    Init,
+    #[command(about = "Initialize config setup")]
+    Init(InitArgs),
     #[command(about = "Manage sessions")]
     Session {
         #[command(subcommand)]
         action: SessionCommands,
     },
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct InitArgs {
+    #[arg(long, help = "Provider name (openrouter, anthropic, openai, gemini, opencode, custom)")]
+    pub provider: Option<String>,
+
+    #[arg(long, help = "API key for the provider")]
+    pub api_key: Option<String>,
+
+    #[arg(long, help = "Model ID")]
+    pub model: Option<String>,
+
+    #[arg(long, help = "Base URL (for custom provider)")]
+    pub base_url: Option<String>,
+
+    #[arg(long, help = "Enable auto-routing (requires ONNX model)")]
+    pub auto_route: Option<bool>,
+
+    #[arg(short = 'y', long, help = "Skip interactive prompts (requires --provider and --api-key)")]
+    pub non_interactive: bool,
 }
 
 #[derive(Parser)]
