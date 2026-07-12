@@ -83,7 +83,12 @@ impl Session {
 
     pub fn load(id: &str) -> anyhow::Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not find home directory"))?;
-        let path = home.join(SESSION_DIR).join(format!("{}.json", id));
+        // Sanitize: strip directory components to prevent path traversal
+        let safe_id = std::path::Path::new(id)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let path = home.join(SESSION_DIR).join(format!("{}.json", safe_id));
         let content = std::fs::read_to_string(&path)?;
         Ok(serde_json::from_str(&content)?)
     }

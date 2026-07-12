@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use anthropic_sdk::{
     types::{
@@ -175,11 +176,12 @@ fn convert_tools(tools: &[ToolDef]) -> Vec<Tool> {
 }
 
 impl AnthropicProvider {
-    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Result<Self, LLMError> {
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str, timeout_secs: u64) -> Result<Self, LLMError> {
         let api_key = cfg.api_key.clone();
         let base_url = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let config = ClientConfig::new(api_key)
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .with_timeout(Duration::from_secs(timeout_secs));
         let client = Anthropic::with_config(config)
             .map_err(|e| LLMError::Config(e.to_string()))?;
         Ok(Self {

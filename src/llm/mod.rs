@@ -207,14 +207,16 @@ pub fn resolve_provider(config: &crate::config::Config) -> Result<Box<dyn LLMPro
 
     let pname = &config.provider;
 
+    let timeout = config.advanced.timeout_secs;
+
     let new_anthropic = || -> Result<Box<dyn LLMProvider>, LLMError> {
-        anthropic::AnthropicProvider::new(provider_cfg, max_tokens, temperature, pname).map(|p| Box::new(p) as Box<dyn LLMProvider>)
+        anthropic::AnthropicProvider::new(provider_cfg, max_tokens, temperature, pname, timeout).map(|p| Box::new(p) as Box<dyn LLMProvider>)
     };
     let new_openai = || -> Result<Box<dyn LLMProvider>, LLMError> {
-        Ok(Box::new(openai::OpenAIProvider::new(provider_cfg, max_tokens, temperature, pname)))
+        openai::OpenAIProvider::new(provider_cfg, max_tokens, temperature, pname, timeout).map(|p| Box::new(p) as Box<dyn LLMProvider>)
     };
     let new_gemini = || -> Result<Box<dyn LLMProvider>, LLMError> {
-        gemini::GeminiProvider::new(provider_cfg, max_tokens, temperature, pname).map(|p| Box::new(p) as Box<dyn LLMProvider>)
+        gemini::GeminiProvider::new(provider_cfg, max_tokens, temperature, pname, timeout).map(|p| Box::new(p) as Box<dyn LLMProvider>)
     };
 
     match pname.as_str() {

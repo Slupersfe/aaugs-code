@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -12,7 +13,7 @@ use crate::config::ProviderConfig;
 
 use gemini_rust::{
     ClientError, Content, FunctionCall, FunctionDeclaration,
-    FunctionResponse, Gemini, Part, Tool, FinishReason,
+    FunctionResponse, Gemini, GeminiBuilder, Part, Tool, FinishReason,
 };
 
 fn convert_error(e: ClientError) -> LLMError {
@@ -51,25 +52,27 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
-    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Result<Self, LLMError> {
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str, timeout_secs: u64) -> Result<Self, LLMError> {
         let model = if cfg.model.starts_with("models/") {
             cfg.model.clone()
         } else {
             format!("models/{}", cfg.model)
         };
 
-        let client = match &cfg.base_url {
-            Some(base_url_str) => {
-                let base_url = url::Url::parse(base_url_str)
-                    .map_err(|e| LLMError::Config(format!("invalid Gemini base URL: {e}")))?;
-                Gemini::with_model_and_base_url(&cfg.api_key, model.clone(), base_url)
-                    .map_err(|e| LLMError::Config(format!("failed to create Gemini client: {e}")))?
-            }
-            None => {
-                Gemini::with_model(&cfg.api_key, model.clone())
-                    .map_err(|e| LLMError::Config(format!("failed to create Gemini client: {e}")))?
-            }
-        };
+        let client_builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs));
+        let mut builder = GeminiBuilder::new(&cfg.api_key)
+            .with_model(model.clone())
+            .with_http_client(client_builder);
+
+        if let Some(base_url_str) = &cfg.base_url {
+            let base_url = url::Url::parse(base_url_str)
+                .map_err(|e| LLMError::Config(format!("invalid Gemini base URL: {e}")))?;
+            builder = builder.with_base_url(base_url);
+        }
+
+        let client = builder.build()
+            .map_err(|e| LLMError::Config(format!("failed to create Gemini client: {e}")))?;
 
         Ok(Self {
             client,

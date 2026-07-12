@@ -67,7 +67,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 SessionCommands::Rm { id } => {
                     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not find home directory"))?;
-                    let path = home.join("vibe/sessions").join(format!("{}.json", id));
+                    // Sanitize: strip directory components to prevent path traversal
+                    let safe_id = std::path::Path::new(id)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("");
+                    let path = home.join("vibe/sessions").join(format!("{}.json", safe_id));
                     if path.exists() {
                         std::fs::remove_file(&path)?;
                         eprintln!("Removed session: {}", id);

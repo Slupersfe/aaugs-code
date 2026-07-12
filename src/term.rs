@@ -17,18 +17,23 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        if let Err(e) = crossterm::terminal::disable_raw_mode() {
+            tracing::warn!("failed to disable raw mode: {e}");
+        }
+        if let Err(e) = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen) {
+            tracing::warn!("failed to leave alternate screen: {e}");
+        }
     }
 }
 
 static SKIN: std::sync::LazyLock<MadSkin> = std::sync::LazyLock::new(|| {
+    use termimad::crossterm::style::Color;
     let mut skin = MadSkin::default();
-    skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);
-    skin.bold.set_fg(termimad::crossterm::style::Color::Yellow);
-    skin.italic.set_fg(termimad::crossterm::style::Color::Magenta);
-    skin.code_block.set_fg(termimad::crossterm::style::Color::Green);
-    skin.code_block.set_bg(termimad::crossterm::style::Color::Reset);
+    skin.set_headers_fg(Color::Rgb { r: 230, g: 120, b: 120 });
+    skin.bold.set_fg(Color::Rgb { r: 240, g: 200, b: 140 });
+    skin.italic.set_fg(Color::Rgb { r: 200, g: 130, b: 150 });
+    skin.code_block.set_fg(Color::Rgb { r: 210, g: 160, b: 120 });
+    skin.code_block.set_bg(Color::Rgb { r: 16, g: 8, b: 10 });
     skin
 });
 
@@ -38,7 +43,7 @@ pub fn render_markdown(text: &str) {
 
 pub fn print_tool_header(name: &str, args: &serde_json::Value) {
     let pretty = serde_json::to_string_pretty(args).unwrap_or_default();
-    let dim_fg = termimad::crossterm::style::Color::DarkYellow;
+    let dim_fg = termimad::crossterm::style::Color::Rgb { r: 235, g: 160, b: 120 };
     use termimad::crossterm::style::Stylize;
     eprintln!("{}", format!("── tool: {} ──", name).with(dim_fg));
     if !pretty.is_empty() && pretty != "null" {
@@ -50,7 +55,7 @@ pub fn print_tool_result(output: &str) {
     if output.is_empty() {
         return;
     }
-    let dim_fg = termimad::crossterm::style::Color::DarkGreen;
+    let dim_fg = termimad::crossterm::style::Color::Rgb { r: 210, g: 160, b: 120 };
     use termimad::crossterm::style::Stylize;
     let lines: Vec<&str> = output.lines().collect();
     let display = if lines.len() > 20 {
@@ -69,13 +74,13 @@ pub fn print_tool_denied(name: &str) {
 }
 
 pub fn print_success() {
-    let dim_fg = termimad::crossterm::style::Color::DarkGreen;
+    let dim_fg = termimad::crossterm::style::Color::Rgb { r: 210, g: 160, b: 120 };
     use termimad::crossterm::style::Stylize;
     eprintln!("{}", "── done ──".with(dim_fg));
 }
 
 pub fn print_info(text: &str) {
-    let dim_fg = termimad::crossterm::style::Color::DarkCyan;
+    let dim_fg = termimad::crossterm::style::Color::Rgb { r: 155, g: 125, b: 130 };
     use termimad::crossterm::style::Stylize;
     eprintln!("{}", text.with(dim_fg));
 }

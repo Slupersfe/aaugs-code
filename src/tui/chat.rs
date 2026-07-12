@@ -5,12 +5,11 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::palette::{
-    BLUE, BORDER, GREEN, MAUVE, OVERLAY, RED, SUBTLE, SURFACE, TEXT, YELLOW,
+    BLUE, BORDER, CODE_BG, GREEN, MAUVE, OVERLAY, RED, SUBTLE, SURFACE, TEXT, YELLOW,
 };
 use super::TuiApp;
 
 const SPINNER_CHARS: &[char] = &['◜', '◝', '◞', '◟'];
-const SEP: &str = " ─";
 
 pub(super) fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
@@ -126,11 +125,16 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         let role_style = Style::default().fg(gutter_color);
         let gutter = Span::styled("▐", role_style);
 
-        // Add thin separator between messages
+        // Add full-width separator between messages
         if !text.lines.is_empty() {
+            let sep_width = area.width.saturating_sub(2) as usize;
             text.push_line(Line::from(vec![
                 Span::styled(
-                    SEP,
+                    "  ".to_string(),
+                    Style::default(),
+                ),
+                Span::styled(
+                    "─".repeat(sep_width),
                     Style::default().fg(SUBTLE).add_modifier(Modifier::DIM),
                 ),
             ]));
@@ -149,12 +153,20 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         // Message content
         let base = Style::default().fg(if matches { role_fg } else { SUBTLE });
         for line in msg.text.lines() {
-            let indent = Span::styled("  ", base);
+            let indent_style = if in_code { base.bg(CODE_BG) } else { base };
+            let indent = Span::styled("  ", indent_style);
             let mut line_text = Text::default();
             super::markdown::push_md_line(&mut line_text, line, base, &mut in_code);
             for text_line in line_text.lines.iter() {
                 let mut spans = vec![indent.clone()];
                 spans.extend(text_line.spans.iter().cloned());
+                if in_code {
+                    let content_width: usize = spans.iter().map(|s| s.content.len()).sum();
+                    let pad = (area.width as usize).saturating_sub(content_width);
+                    if pad > 0 {
+                        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(CODE_BG)));
+                    }
+                }
                 text.push_line(Line::from(spans));
             }
         }
@@ -191,15 +203,15 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let (fg, prompt) = if app.is_loading {
+    let (fg, prompt, is_placeholder) = if app.is_loading {
         let spinner = SPINNER_CHARS[(app.spinner_frame as usize / 4) % SPINNER_CHARS.len()];
-        (SUBTLE, format!(" {} ", spinner))
+        (SUBTLE, format!(" {} ", spinner), false)
     } else if app.pending_question.is_some() {
-        (YELLOW, " ❓ ".to_string())
+        (YELLOW, " ❓ ".to_string(), true)
     } else if app.input.is_empty() {
-        (SUBTLE, " ❯ ".to_string())
+        (SUBTLE, " ❯ ".to_string(), true)
     } else {
-        (TEXT, " ❯ ".to_string())
+        (TEXT, " ❯ ".to_string(), false)
     };
 
     let tokens = if !app.is_loading && !app.input.is_empty() {
@@ -223,6 +235,12 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
         app.input.clone()
     };
 
+    let text_style = if is_placeholder {
+        Style::default().fg(fg).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(fg)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -233,7 +251,7 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let mut spans = vec![
         Span::styled(prompt, Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)),
-        Span::styled(display, Style::default().fg(fg)),
+        Span::styled(display, text_style),
     ];
     if !tokens.is_empty() {
         let token_style = Style::default().fg(SUBTLE).add_modifier(Modifier::DIM);
@@ -248,6 +266,14 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let input_widget = Paragraph::new(Line::from(spans));
     frame.render_widget(input_widget, inner);
+
+    // Set cursor position for visible typing cursor
+    if !app.is_loading && app.pending_question.is_none() {
+        let cursor_x = inner.x + 3 + app.cursor as u16;
+        let cursor_y = inner.y;
+        let cursor_x = cursor_x.min(inner.x + inner.width.saturating_sub(1));
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn draw_keybinds(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -323,7 +349,8 @@ fn draw_question_overlay(frame: &mut Frame, app: &TuiApp, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(YELLOW))
             .border_type(BorderType::Rounded);
-        let prompt = Paragraph::new(text).block(block);
-        frame.render_widget(prompt, q_area);
+    let prompt = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(prompt, q_area);
+
     }
 }

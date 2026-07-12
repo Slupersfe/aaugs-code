@@ -146,19 +146,22 @@ fn convert_tools(tools: &[ToolDef]) -> Vec<ChatCompletionTools> {
 }
 
 impl OpenAIProvider {
-    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
+    /// Note: `timeout_secs` is accepted for API consistency but not applied to the SDK,
+    /// because async-openai 0.41 depends on reqwest 0.13 (project uses 0.12),
+    /// preventing us from passing a custom reqwest client with a timeout.
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str, _timeout_secs: u64) -> Result<Self, LLMError> {
         let api_key = cfg.api_key.clone();
         let base_url = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let config = OpenAIConfig::new()
             .with_api_key(api_key)
             .with_api_base(base_url);
-        Self {
+        Ok(Self {
             client: Client::with_config(config),
             model: cfg.model.clone(),
             max_tokens,
             temperature,
             provider_name: provider_name.to_string(),
-        }
+        })
     }
 
 }

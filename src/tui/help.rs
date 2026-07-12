@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::palette::{BLUE, MAUVE};
@@ -86,6 +86,7 @@ pub(super) fn draw_help(frame: &mut Frame, app: &TuiApp) {
         .border_style(Style::default().fg(BLUE));
     let help = Paragraph::new(text)
         .block(block)
+        .wrap(Wrap { trim: false })
         .scroll((app.help_scroll as u16, 0));
     frame.render_widget(help, chunks[0]);
 

@@ -21,7 +21,7 @@ fn ensure_live_prices() {
         match fetch_from_openrouter() {
             Ok(prices) => {
                 tracing::info!("fetched live pricing for {} models", prices.len());
-                let mut cache = LIVE_PRICES.lock().unwrap();
+                let mut cache = LIVE_PRICES.lock().unwrap_or_else(|e| e.into_inner());
                 *cache = Some((prices, Instant::now()));
             }
             Err(e) => {
@@ -73,7 +73,7 @@ fn fetch_from_openrouter() -> Result<HashMap<String, Pricing>, reqwest::Error> {
 
 /// Look up pricing in the live cache (if populated).
 fn live_model_cost(model: &str) -> Option<Pricing> {
-    let cache = LIVE_PRICES.lock().unwrap();
+    let cache = LIVE_PRICES.lock().unwrap_or_else(|e| e.into_inner());
     let (prices, fetched_at) = cache.as_ref()?;
     if fetched_at.elapsed() > CACHE_TTL {
         return None; // stale

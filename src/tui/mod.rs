@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use tokio::sync::oneshot;
 
@@ -312,6 +313,8 @@ impl TuiApp {
 // ── Render dispatcher ─────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &mut TuiApp) {
+    let bg = Paragraph::new("").style(Style::default().bg(palette::SURFACE));
+    frame.render_widget(bg, frame.area());
     match app.mode {
         AppMode::Chat => chat::draw_chat(frame, app),
         AppMode::Help => help::draw_help(frame, app),
