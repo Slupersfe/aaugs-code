@@ -927,6 +927,10 @@ async fn try_stream_with_fallback(
     state: &mut ChatState,
     tools: &[ToolDef],
 ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<LLMEvent, LLMError>> + Send>>> {
+    if let Err(e) = crate::llm::validate_request(&state.session.messages, tools) {
+        return Err(anyhow::anyhow!("{}", e));
+    }
+
     let primary_result = crate::llm::retry_with_backoff(
         || state.provider.stream_chat(&state.session.messages, tools),
         2,
@@ -1319,6 +1323,7 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
     let (input_tx, input_rx) = std::sync::mpsc::channel::<String>();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_tui = cancelled.clone();
+    let force_exit = Arc::new(AtomicBool::new(false));
 
     let model = state.model.clone();
     let provider_name = state.provider.name().to_string();
@@ -1331,6 +1336,37 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
     if let Some(ver) = latest_release {
         let _ = event_tx.send(AppEvent::UpdateAvailable(ver));
     }
+
+    // Signal handler for graceful shutdown on SIGTERM/SIGINT
+    let fe_tui = force_exit.clone();
+    let cancelled_sig = cancelled.clone();
+    let sig_input_tx = input_tx.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let mut term_signal = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).ok();
+        #[cfg(not(unix))]
+        let mut term_signal: Option<tokio::signal::unix::Signal> = None;
+
+        tokio::select! {
+            _ = async {
+                if let Some(ref mut sig) = term_signal {
+                    sig.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+            _ = tokio::signal::ctrl_c() => {
+                // First Ctrl+C during TUI is handled by TUI itself.
+                // Only act if we're in non-TUI mode or the TUI didn't catch it.
+            }
+        }
+
+        fe_tui.store(true, Ordering::SeqCst);
+        cancelled_sig.store(true, Ordering::SeqCst);
+        let _ = sig_input_tx.send("/exit".to_string());
+    });
 
     // Spawn processing on tokio runtime
     let processing = tokio::spawn(async move {
@@ -1365,15 +1401,14 @@ pub async fn run_tui_interactive(mut state: ChatState, latest_release: Option<u3
 
     // Spawn TUI on blocking thread
     let tui_input_tx = input_tx.clone();
+    let fe_tui_ref = force_exit.clone();
     let tui_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        crossterm::terminal::enable_raw_mode()?;
+        let _guard = crate::term::RawModeGuard::new()?;
         let mut terminal = ratatui::Terminal::new(
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
         )?;
         terminal.clear()?;
-        let result = tui::run_tui(&mut app, &mut terminal, &tui_input_tx, &cancelled_tui);
-        crossterm::terminal::disable_raw_mode()?;
-        result
+        tui::run_tui(&mut app, &mut terminal, &tui_input_tx, &cancelled_tui, &fe_tui_ref)
     });
 
     // Wait for TUI to finish

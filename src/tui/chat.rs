@@ -10,6 +10,7 @@ use super::palette::{
 use super::TuiApp;
 
 const SPINNER_CHARS: &[char] = &['◜', '◝', '◞', '◟'];
+const SEP: &str = " ─";
 
 pub(super) fn draw_chat(frame: &mut Frame, app: &mut TuiApp) {
     let area = frame.area();
@@ -125,6 +126,16 @@ fn draw_messages(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         let role_style = Style::default().fg(gutter_color);
         let gutter = Span::styled("▐", role_style);
 
+        // Add thin separator between messages
+        if !text.lines.is_empty() {
+            text.push_line(Line::from(vec![
+                Span::styled(
+                    SEP,
+                    Style::default().fg(SUBTLE).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+
         // Add the role line
         let role_line = Line::from(vec![
             gutter,
@@ -214,7 +225,7 @@ fn draw_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
@@ -311,7 +322,7 @@ fn draw_question_overlay(frame: &mut Frame, app: &TuiApp, area: Rect) {
             .title(" Permission Required ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(YELLOW))
-            .border_type(BorderType::Plain);
+            .border_type(BorderType::Rounded);
         let prompt = Paragraph::new(text).block(block);
         frame.render_widget(prompt, q_area);
     }

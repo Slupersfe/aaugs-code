@@ -20,8 +20,12 @@ dirs = "5"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 futures = "0.3"
 async-trait = "0.1"
+url = "2"
 regex = "1"
 glob = "0.3"
+async-openai = { version = "0.41", default-features = false, features = ["chat-completion"] }
+anthropic-sdk-rust = "0.1"
+gemini-rust = "2"
 termimad = "0.31"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.29"

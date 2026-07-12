@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,22 @@ pub struct Config {
     pub permissions: PermissionsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &self.api_key.as_str().chars().take(4).chain("...".chars()).collect::<String>())
+            .field("model", &self.model)
+            .field("auto_route", &self.auto_route)
+            .field("router_model_path", &self.router_model_path)
+            .field("model_categories", &self.model_categories)
+            .field("preferred_models", &self.preferred_models)
+            .field("base_url", &self.base_url)
+            .field("fallback", &self.fallback)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: String,
@@ -318,6 +334,24 @@ impl Config {
                 provider,
                 provider
             );
+        }
+        if let Some(cfg) = self.provider_config() {
+            if cfg.api_key.is_empty() {
+                anyhow::bail!("api_key for provider '{provider}' is empty");
+            }
+            if cfg.model.is_empty() {
+                anyhow::bail!("model for provider '{provider}' is empty");
+            }
+        }
+        let adv = &self.advanced;
+        if adv.max_tokens == 0 || adv.max_tokens > 1_000_000 {
+            anyhow::bail!("max_tokens must be between 1 and 1,000,000");
+        }
+        if !(0.0..=2.0).contains(&adv.temperature) {
+            anyhow::bail!("temperature must be between 0.0 and 2.0");
+        }
+        if adv.timeout_secs < 1 || adv.timeout_secs > 3600 {
+            anyhow::bail!("timeout_secs must be between 1 and 3600");
         }
         Ok(())
     }

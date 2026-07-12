@@ -158,7 +158,7 @@ fn softmax_argmax(logits: &[f32]) -> Option<(i64, f32)> {
     }
     let idx = probs.iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as i64)?;
     let conf = probs[idx as usize] / sum;
     Some((idx, conf))

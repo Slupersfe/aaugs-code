@@ -5,6 +5,23 @@ use std::time::Duration;
 
 use termimad::MadSkin;
 
+/// RAII guard that restores terminal raw mode on drop or panic.
+pub struct RawModeGuard;
+
+impl RawModeGuard {
+    pub fn new() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    }
+}
+
 static SKIN: std::sync::LazyLock<MadSkin> = std::sync::LazyLock::new(|| {
     let mut skin = MadSkin::default();
     skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);

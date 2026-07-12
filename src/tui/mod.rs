@@ -23,6 +23,7 @@ pub enum AppEvent {
     ToolResult { name: String, output: String },
     ToolDenied { name: String },
     TurnDone,
+    #[allow(dead_code)]
     Cancel,
     Error(String),
     Usage {
@@ -325,8 +326,13 @@ pub fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     input_tx: &mpsc::Sender<String>,
     cancelled: &Arc<AtomicBool>,
+    force_exit: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     loop {
+        if force_exit.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         terminal.draw(|f| draw(f, app))?;
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
 

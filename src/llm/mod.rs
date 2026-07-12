@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::Value;
 
 pub use message::*;
@@ -122,92 +122,7 @@ pub trait LLMProvider: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LLMEvent, LLMError>> + Send>>, LLMError>;
 }
 
-pub struct SseEvent {
-    pub event: Option<String>,
-    pub data: String,
-}
 
-pub async fn read_sse_stream(
-    response: reqwest::Response,
-) -> Result<Pin<Box<dyn Stream<Item = Result<SseEvent, LLMError>> + Send>>, LLMError> {
-    use tokio::sync::mpsc;
-
-    let (tx, rx) = mpsc::unbounded_channel::<Result<SseEvent, LLMError>>();
-    let mut byte_stream = response.bytes_stream();
-
-    tokio::spawn(async move {
-        let mut current_event: Option<String> = None;
-        let mut current_data = String::new();
-        let mut buf = String::new();
-
-        while let Some(chunk_result) = byte_stream.next().await {
-            let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Err(LLMError::Network(e)));
-                    return;
-                }
-            };
-
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete lines from the buffer
-            loop {
-                let newline_pos = match buf.find('\n') {
-                    Some(pos) => pos,
-                    None => break,
-                };
-
-                let line = buf[..newline_pos].to_string();
-                buf = buf[newline_pos + 1..].to_string();
-                let trimmed = line.trim_end();
-
-                if trimmed.is_empty() {
-                    if !current_data.is_empty() {
-                        let event = SseEvent {
-                            event: current_event.take(),
-                            data: std::mem::take(&mut current_data),
-                        };
-                        let _ = tx.send(Ok(event));
-                    }
-                    continue;
-                }
-
-                if let Some(data) = trimmed.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        let _ = tx.send(Err(LLMError::Stream("done".to_string())));
-                        return;
-                    }
-                    current_data.push_str(data);
-                } else if let Some(event) = trimmed.strip_prefix("event: ") {
-                    current_event = Some(event.to_string());
-                }
-            }
-        }
-
-        // Flush remaining data
-        if !current_data.is_empty() {
-            let event = SseEvent {
-                event: current_event.take(),
-                data: std::mem::take(&mut current_data),
-            };
-            let _ = tx.send(Ok(event));
-        }
-    });
-
-    let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-
-    // Filter out the Stream error we used for DONE signal
-    let filtered = rx_stream.filter_map(|result| {
-        futures::future::ready(match result {
-            Ok(event) => Some(Ok(event)),
-            Err(LLMError::Stream(ref msg)) if msg == "done" => None,
-            Err(e) => Some(Err(e)),
-        })
-    });
-
-    Ok(Box::pin(filtered))
-}
 
 /// Retries an async fallible operation with exponential backoff.
 /// Retries on HTTP 429 (rate limit), 5xx (server errors), and transient 400s (upstream failures)
@@ -222,14 +137,14 @@ where
             Ok(val) => return Ok(val),
             Err(LLMError::Http { status, body }) if status.as_u16() == 400 && body.contains("Upstream request failed") => {
                 if attempt == max_retries {
-                    return Err(LLMError::Http { status: status.clone(), body: body.clone() });
+                    return Err(LLMError::Http { status, body: body.clone() });
                 }
                 let wait_ms = 1000u64 * 2u64.pow(attempt);
                 tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
             }
             Err(LLMError::Http { status, body }) if status.as_u16() == 429 || status.as_u16() >= 500 => {
                 if attempt == max_retries {
-                    return Err(LLMError::Http { status: status.clone(), body: body.clone() });
+                    return Err(LLMError::Http { status, body: body.clone() });
                 }
                 let wait_ms = 1000u64 * 2u64.pow(attempt);
                 tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
@@ -238,6 +153,48 @@ where
         }
     }
     unreachable!()
+}
+
+/// Validates a request before sending to prevent cryptic 400 errors.
+/// Checks message ordering (tool results must reference valid tool call IDs)
+/// and estimates request body size against a reasonable limit.
+pub fn validate_request(messages: &[Message], _tools: &[ToolDef]) -> Result<(), LLMError> {
+    use std::collections::HashSet;
+    let mut tool_call_ids: HashSet<&str> = HashSet::new();
+
+    for msg in messages {
+        match msg.role {
+            Role::Assistant => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolUse { id, .. } = block {
+                        tool_call_ids.insert(id.as_str());
+                    }
+                }
+            }
+            Role::Tool => {
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        if !tool_call_ids.contains(tool_use_id.as_str()) {
+                            return Err(LLMError::Config(
+                                format!("tool result references unknown tool call: {}", tool_use_id)
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Ok(body) = serde_json::to_string(messages) {
+        if body.len() > 4_000_000 {
+            return Err(LLMError::Config(
+                format!("request body too large: {} bytes (max 4MB)", body.len())
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn resolve_provider(config: &crate::config::Config) -> Result<Box<dyn LLMProvider>, LLMError> {
@@ -250,14 +207,20 @@ pub fn resolve_provider(config: &crate::config::Config) -> Result<Box<dyn LLMPro
 
     let pname = &config.provider;
 
-    let new_anthropic = || anthropic::AnthropicProvider::new(provider_cfg, max_tokens, temperature, pname);
-    let new_openai = || openai::OpenAIProvider::new(provider_cfg, max_tokens, temperature, pname);
-    let new_gemini = || gemini::GeminiProvider::new(provider_cfg, max_tokens, temperature, pname);
+    let new_anthropic = || -> Result<Box<dyn LLMProvider>, LLMError> {
+        anthropic::AnthropicProvider::new(provider_cfg, max_tokens, temperature, pname).map(|p| Box::new(p) as Box<dyn LLMProvider>)
+    };
+    let new_openai = || -> Result<Box<dyn LLMProvider>, LLMError> {
+        Ok(Box::new(openai::OpenAIProvider::new(provider_cfg, max_tokens, temperature, pname)))
+    };
+    let new_gemini = || -> Result<Box<dyn LLMProvider>, LLMError> {
+        gemini::GeminiProvider::new(provider_cfg, max_tokens, temperature, pname).map(|p| Box::new(p) as Box<dyn LLMProvider>)
+    };
 
     match pname.as_str() {
-        "anthropic" => Ok(Box::new(new_anthropic())),
-        "openai" => Ok(Box::new(new_openai())),
-        "gemini" => Ok(Box::new(new_gemini())),
+        "anthropic" => new_anthropic(),
+        "openai" => new_openai(),
+        "gemini" => new_gemini(),
         "opencode" => {
             let dev_path = dirs::home_dir()
                 .map(|h| h.join("vibe").join("dev.config"));
@@ -270,16 +233,16 @@ pub fn resolve_provider(config: &crate::config::Config) -> Result<Box<dyn LLMPro
                     "opencode provider requires ~/vibe/dev.config with content 'TRUE'".into()
                 ));
             }
-            Ok(Box::new(new_openai()))
+            new_openai()
         }
         "openrouter" => match api_format {
-            "anthropic" => Ok(Box::new(new_anthropic())),
-            _           => Ok(Box::new(new_openai())),
+            "anthropic" => new_anthropic(),
+            _           => new_openai(),
         },
         "custom" => match api_format {
-            "anthropic" => Ok(Box::new(new_anthropic())),
-            "gemini" | "google" => Ok(Box::new(new_gemini())),
-            _ => Ok(Box::new(new_openai())),
+            "anthropic" => new_anthropic(),
+            "gemini" | "google" => new_gemini(),
+            _ => new_openai(),
         },
         _ => Err(LLMError::Config(format!("unknown provider '{}'", pname))),
     }

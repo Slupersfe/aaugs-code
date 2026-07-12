@@ -1,184 +1,195 @@
 use std::pin::Pin;
 
+use anthropic_sdk::{
+    types::{
+        ContentBlockDelta, AnthropicError, ContentBlock as AnthropicContentBlock,
+        ContentBlockParam, MessageContent, MessageParam, MessageStreamEvent, Role as AnthropicRole,
+        StopReason, Tool, ToolInputSchema,
+    },
+    Anthropic, ClientConfig, MessageCreateBuilder,
+};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use reqwest::Client;
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use super::{
-    LLMError, LLMEvent, LLMProvider, Message, ToolDef, read_sse_stream,
-    ContentBlock, Role,
-};
+use super::{ContentBlock, LLMError, LLMEvent, LLMProvider, Message, Role, ToolDef};
 use crate::config::ProviderConfig;
 
-const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 pub struct AnthropicProvider {
-    client: Client,
-    api_key: String,
+    client: Anthropic,
     model: String,
-    base_url: String,
     max_tokens: u32,
     temperature: f32,
     provider_name: String,
 }
 
-#[derive(Serialize)]
-struct AnthropicRequest {
-    model: String,
-    max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<serde_json::Value>,
-    messages: Vec<AnthropicMessage>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<AnthropicTool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    stream: bool,
+fn convert_error(e: AnthropicError) -> LLMError {
+    match e {
+        AnthropicError::BadRequest { message, status }
+        | AnthropicError::Authentication { message, status }
+        | AnthropicError::PermissionDenied { message, status }
+        | AnthropicError::NotFound { message, status }
+        | AnthropicError::UnprocessableEntity { message, status }
+        | AnthropicError::RateLimit { message, status }
+        | AnthropicError::InternalServer { message, status } => {
+            let code = reqwest::StatusCode::from_u16(status)
+                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+            LLMError::Http { status: code, body: message }
+        }
+        AnthropicError::Connection { message }
+        | AnthropicError::NetworkError(message)
+        | AnthropicError::HttpError { message, .. }
+        | AnthropicError::ServiceUnavailable { message }
+        | AnthropicError::Other(message) => LLMError::Stream(message),
+        AnthropicError::ConnectionTimeout => LLMError::Stream("connection timeout".into()),
+        AnthropicError::UserAbort => LLMError::Stream("user aborted".into()),
+        AnthropicError::StreamError(msg) => LLMError::Stream(msg),
+        AnthropicError::Configuration { message } => LLMError::Config(message),
+        AnthropicError::InvalidApiKey => LLMError::Config("invalid API key".into()),
+        AnthropicError::Timeout => LLMError::Stream("timeout".into()),
+    }
 }
 
-#[derive(Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: Value,
+fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<MessageParam>) {
+    let mut system: Option<String> = None;
+    let mut api_messages = Vec::new();
+    let total_msgs = messages.len();
+
+    for (idx, msg) in messages.iter().enumerate() {
+        match msg.role {
+            Role::System => {
+                let text = msg.content.iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::Text { text } = b { Some(text.clone()) }
+                        else { None }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    system = Some(text);
+                }
+            }
+            Role::User => {
+                let blocks: Vec<ContentBlockParam> = msg.content.iter().map(|b| {
+                    match b {
+                        ContentBlock::Text { text } => {
+                            ContentBlockParam::Text { text: text.clone() }
+                        }
+                        _ => ContentBlockParam::Text { text: String::new() },
+                    }
+                }).collect();
+
+                if idx == 0 && total_msgs > 1 {
+                    // Cache the first user message for prompt caching
+                    // (the SDK doesn't expose cache_control directly, so skip for now)
+                }
+
+                api_messages.push(MessageParam {
+                    role: AnthropicRole::User,
+                    content: if blocks.len() == 1 {
+                        match blocks.into_iter().next().unwrap() {
+                            ContentBlockParam::Text { text } => MessageContent::Text(text),
+                            other => MessageContent::Blocks(vec![other]),
+                        }
+                    } else {
+                        MessageContent::Blocks(blocks)
+                    },
+                });
+            }
+            Role::Assistant => {
+                let mut blocks: Vec<ContentBlockParam> = msg.content.iter().filter_map(|b| {
+                    match b {
+                        ContentBlock::Text { text } => {
+                            if text.is_empty() { None }
+                            else { Some(ContentBlockParam::Text { text: text.clone() }) }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some(ContentBlockParam::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            })
+                        }
+                        _ => None,
+                    }
+                }).collect();
+
+                if blocks.is_empty() {
+                    blocks.push(ContentBlockParam::Text { text: String::new() });
+                }
+
+                api_messages.push(MessageParam {
+                    role: AnthropicRole::Assistant,
+                    content: MessageContent::Blocks(blocks),
+                });
+            }
+            Role::Tool => {
+                let blocks: Vec<ContentBlockParam> = msg.content.iter().map(|b| {
+                    match b {
+                        ContentBlock::ToolResult { tool_use_id, content } => {
+                            ContentBlockParam::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: Some(content.clone()),
+                                is_error: None,
+                            }
+                        }
+                        _ => ContentBlockParam::Text { text: String::new() },
+                    }
+                }).collect();
+
+                api_messages.push(MessageParam {
+                    role: AnthropicRole::User,
+                    content: MessageContent::Blocks(blocks),
+                });
+            }
+        }
+    }
+
+    (system, api_messages)
 }
 
-#[derive(Serialize)]
-struct AnthropicTool {
-    name: String,
-    description: String,
-    input_schema: Value,
+fn convert_tools(tools: &[ToolDef]) -> Vec<Tool> {
+    tools.iter().map(|t| {
+        let properties: Map<String, Value> = t.input_schema.get("properties")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let required: Vec<String> = t.input_schema.get("required")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        Tool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".to_string(),
+                properties,
+                required,
+                additional: Map::new(),
+            },
+        }
+    }).collect()
 }
 
 impl AnthropicProvider {
-    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
-        Self {
-            client: Client::new(),
-            api_key: cfg.api_key.clone(),
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Result<Self, LLMError> {
+        let api_key = cfg.api_key.clone();
+        let base_url = cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let config = ClientConfig::new(api_key)
+            .with_base_url(base_url);
+        let client = Anthropic::with_config(config)
+            .map_err(|e| LLMError::Config(e.to_string()))?;
+        Ok(Self {
+            client,
             model: cfg.model.clone(),
-            base_url: cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             max_tokens,
             temperature,
             provider_name: provider_name.to_string(),
-        }
+        })
     }
-
-    fn base_url(&self) -> String {
-        self.base_url.trim_end_matches('/').to_string()
-    }
-
-    fn convert_messages(&self, messages: &[Message]) -> (Option<serde_json::Value>, Vec<AnthropicMessage>) {
-        let mut system: Option<serde_json::Value> = None;
-        let mut api_messages = Vec::new();
-        let total_msgs = messages.len();
-
-        for (idx, msg) in messages.iter().enumerate() {
-            match msg.role {
-                Role::System => {
-                    let text = msg.content.iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b { Some(text.clone()) }
-                            else { None }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        system = Some(json!([{
-                            "type": "text",
-                            "text": text,
-                            "cache_control": { "type": "ephemeral" }
-                        }]));
-                    }
-                }
-                Role::User => {
-                    let mut content = if msg.content.len() == 1 {
-                        if let Some(ContentBlock::Text { text }) = msg.content.first() {
-                            json!([{ "type": "text", "text": text }])
-                        } else {
-                            self.convert_content_blocks(&msg.content)
-                        }
-                    } else {
-                        self.convert_content_blocks(&msg.content)
-                    };
-                    // Cache the first user message for prompt caching on subsequent turns
-                    if idx == 0 && total_msgs > 1 {
-                        if let Value::Array(ref mut blocks) = content {
-                            if let Some(first) = blocks.first_mut() {
-                                if let Value::Object(ref mut map) = first {
-                                    map.insert("cache_control".into(), json!({ "type": "ephemeral" }));
-                                }
-                            }
-                        }
-                    }
-                    api_messages.push(AnthropicMessage {
-                        role: "user".to_string(),
-                        content,
-                    });
-                }
-                Role::Assistant => {
-                    api_messages.push(AnthropicMessage {
-                        role: "assistant".to_string(),
-                        content: self.convert_content_blocks(&msg.content),
-                    });
-                }
-                Role::Tool => {
-                    let blocks: Vec<Value> = msg.content.iter().map(|block| {
-                        match block {
-                            ContentBlock::ToolResult { tool_use_id, content } => {
-                                json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_use_id,
-                                    "content": content
-                                })
-                            }
-                            _ => json!({}),
-                        }
-                    }).collect();
-                    api_messages.push(AnthropicMessage {
-                        role: "user".to_string(),
-                        content: if blocks.len() == 1 { blocks[0].clone() }
-                                 else { Value::Array(blocks) },
-                    });
-                }
-            }
-        }
-
-        (system, api_messages)
-    }
-
-    fn convert_content_blocks(&self, blocks: &[ContentBlock]) -> Value {
-        let items: Vec<Value> = blocks.iter().map(|block| match block {
-            ContentBlock::Text { text } => {
-                json!({"type": "text", "text": text})
-            }
-            ContentBlock::ToolUse { id, name, input } => {
-                json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input
-                })
-            }
-            ContentBlock::ToolResult { tool_use_id, content } => {
-                json!({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": content
-                })
-            }
-        }).collect();
-        Value::Array(items)
-    }
-
-    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<AnthropicTool> {
-        tools.iter().map(|t| AnthropicTool {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            input_schema: t.input_schema.clone(),
-        }).collect()
-    }
-
 }
 
 #[async_trait]
@@ -195,47 +206,38 @@ impl LLMProvider for AnthropicProvider {
         self.model = model.to_string();
     }
 
+    #[tracing::instrument(skip(self, messages, tools))]
     async fn stream_chat(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LLMEvent, LLMError>> + Send>>, LLMError> {
-        let (system, api_messages) = self.convert_messages(messages);
-        let api_tools = self.convert_tools(tools);
+        let (system, api_messages) = convert_messages(messages);
+        let api_tools = convert_tools(tools);
 
-        let body = AnthropicRequest {
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
-            system,
-            messages: api_messages,
-            tools: api_tools,
-            temperature: Some(self.temperature),
-            stream: true,
-        };
+        let mut builder = MessageCreateBuilder::new(&self.model, self.max_tokens)
+            .temperature(self.temperature)
+            .stream(true);
 
-        let url = format!("{}/messages", self.base_url());
-        let response = self.client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LLMError::Http { status, body });
+        if let Some(system_text) = system {
+            builder = builder.system(system_text);
         }
 
-        // For streaming, we need a more sophisticated approach due to
-        // Anthropic's content_block events requiring state tracking.
-        // We'll use a simple stateful channel-based approach.
+        for msg in api_messages {
+            builder = builder.message(msg.role, msg.content);
+        }
+
+        if !api_tools.is_empty() {
+            builder = builder.tools(api_tools);
+        }
+
+        let params = builder.build();
+        let sdk_stream = self.client.messages().create_stream(params).await
+            .map_err(convert_error)?;
+
         use tokio::sync::mpsc;
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<LLMEvent, LLMError>>();
-        let mut sse_stream = read_sse_stream(response).await?;
 
         tokio::spawn(async move {
             let mut text_buf = String::new();
@@ -244,125 +246,93 @@ impl LLMProvider for AnthropicProvider {
             let mut tool_json_buf = String::new();
             let mut in_tool_block = false;
 
-            while let Some(event_result) = sse_stream.next().await {
-                match event_result {
-                    Ok(sse) => {
-                        let data = &sse.data;
-                        let parsed: Value = match serde_json::from_str(data) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
+            let mut stream = sdk_stream;
 
-                        let ev_type = sse.event.as_deref()
-                            .or_else(|| parsed.get("type").and_then(|t| t.as_str()))
-                            .unwrap_or("");
+            while let Some(event_result) = stream.next().await {
+                let event = match event_result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = tx.send(Err(convert_error(e)));
+                        break;
+                    }
+                };
 
-                        match ev_type {
-                            "content_block_start" => {
-                                // Flush any accumulated text
-                                if !text_buf.is_empty() {
-                                    let _ = tx.send(Ok(LLMEvent::Text(
-                                        std::mem::take(&mut text_buf)
-                                    )));
-                                }
+                match event {
+                    MessageStreamEvent::ContentBlockStart { content_block, .. } => {
+                        if !text_buf.is_empty() {
+                            let _ = tx.send(Ok(LLMEvent::Text(
+                                std::mem::take(&mut text_buf),
+                            )));
+                        }
 
-                                if let Some(block) = parsed.get("content_block") {
-                                    match block.get("type").and_then(|t| t.as_str()) {
-                                        Some("text") => {}
-                                        Some("tool_use") => {
-                                            in_tool_block = true;
-                                            tool_id = block.get("id").and_then(|v| v.as_str()).map(String::from);
-                                            tool_name = block.get("name").and_then(|v| v.as_str()).map(String::from);
-                                            tool_json_buf.clear();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            "content_block_delta" => {
-                                if let Some(delta) = parsed.get("delta") {
-                                    match delta.get("type").and_then(|t| t.as_str()) {
-                                        Some("text_delta") => {
-                                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                                text_buf.push_str(text);
-                                            }
-                                        }
-                                        Some("input_json_delta")
-                                            if in_tool_block => {
-                                                if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                                                    tool_json_buf.push_str(partial);
-                                                }
-                                            }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            "content_block_stop"
-                                if in_tool_block => {
-                                    in_tool_block = false;
-                                    let args: Value = serde_json::from_str(&tool_json_buf)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!("failed to parse tool call args: {}", e);
-                                            json!({})
-                                        });
-                                    if let (Some(id), Some(name)) = (tool_id.take(), tool_name.take()) {
-                                        let _ = tx.send(Ok(LLMEvent::ToolCall {
-                                            id,
-                                            name,
-                                            args,
-                                        }));
-                                    }
-                                }
-                            "message_delta" => {
-                                // Flush remaining text
-                                if !text_buf.is_empty() {
-                                    let _ = tx.send(Ok(LLMEvent::Text(
-                                        std::mem::take(&mut text_buf)
-                                    )));
-                                }
-                                if let Some(delta) = parsed.get("delta") {
-                                    if let Some(reason) = delta.get("stop_reason").and_then(|r| r.as_str()) {
-                                        let _ = tx.send(Ok(LLMEvent::Stop {
-                                            finish_reason: reason.to_string(),
-                                        }));
-                                    }
-                                }
-                                // Extract usage
-                                if let Some(usage) = parsed.get("usage") {
-                                    let prompt = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                    let completion = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                    let total = prompt + completion;
-                                    if total > 0 {
-                                        let _ = tx.send(Ok(LLMEvent::Usage(crate::llm::Usage {
-                                            prompt_tokens: prompt,
-                                            completion_tokens: completion,
-                                            total_tokens: total,
-                                            cost: 0.0,
-                                        })));
-                                    }
-                                }
-                            }
-                            "error" => {
-                                let err_val = parsed.get("error");
-                                let msg = err_val
-                                    .and_then(|e| e.get("message").and_then(|v| v.as_str()))
-                                    .or_else(|| err_val.and_then(|e| e.as_str().map(|s| s)));
-                                if let Some(msg) = msg {
-                                    let _ = tx.send(Err(LLMError::Http {
-                                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                                        body: msg.to_string(),
-                                    }));
-                                }
+                        match content_block {
+                            AnthropicContentBlock::Text { .. } => {}
+                            AnthropicContentBlock::ToolUse { id, name, .. } => {
+                                in_tool_block = true;
+                                tool_id = Some(id);
+                                tool_name = Some(name);
+                                tool_json_buf.clear();
                             }
                             _ => {}
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
+                    MessageStreamEvent::ContentBlockDelta { delta, .. } => {
+                        match delta {
+                            ContentBlockDelta::TextDelta { text } => {
+                                text_buf.push_str(&text);
+                            }
+                            ContentBlockDelta::InputJsonDelta { partial_json }
+                                if in_tool_block => {
+                                    tool_json_buf.push_str(&partial_json);
+                                }
+                            _ => {}
+                        }
                     }
+                    MessageStreamEvent::ContentBlockStop { .. } if in_tool_block => {
+                        in_tool_block = false;
+                        let args: Value = serde_json::from_str(&tool_json_buf)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("failed to parse tool call args: {}", e);
+                                json!({})
+                            });
+                        if let (Some(id), Some(name)) = (tool_id.take(), tool_name.take()) {
+                            let _ = tx.send(Ok(LLMEvent::ToolCall { id, name, args }));
+                        }
+                    }
+                    MessageStreamEvent::MessageDelta { delta, usage } => {
+                        if !text_buf.is_empty() {
+                            let _ = tx.send(Ok(LLMEvent::Text(
+                                std::mem::take(&mut text_buf),
+                            )));
+                        }
+
+                        if let Some(reason) = delta.stop_reason {
+                            let reason_str = match reason {
+                                StopReason::EndTurn => "end_turn",
+                                StopReason::MaxTokens => "max_tokens",
+                                StopReason::StopSequence => "stop_sequence",
+                                StopReason::ToolUse => "tool_use",
+                            };
+                            let _ = tx.send(Ok(LLMEvent::Stop {
+                                finish_reason: reason_str.to_string(),
+                            }));
+                        }
+
+                        if usage.output_tokens > 0 {
+                            let _ = tx.send(Ok(LLMEvent::Usage(crate::llm::Usage {
+                                prompt_tokens: usage.input_tokens.unwrap_or(0),
+                                completion_tokens: usage.output_tokens,
+                                total_tokens: usage.input_tokens.unwrap_or(0) + usage.output_tokens,
+                                cost: 0.0,
+                            })));
+                        }
+                    }
+                    MessageStreamEvent::MessageStop => break,
+                    _ => {}
                 }
             }
+
+            let _ = std::mem::take(&mut text_buf);
         });
 
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);

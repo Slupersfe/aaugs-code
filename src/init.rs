@@ -288,7 +288,12 @@ fn download_onnx_model(model_dir: &std::path::Path) -> anyhow::Result<()> {
         print!("  ⬇ {} ... ", file);
         std::io::stdout().flush().ok();
 
-        let response = reqwest::blocking::get(&url)
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("failed to build HTTP client")?;
+        let response = client.get(&url)
+            .send()
             .with_context(|| format!("failed to download {}", url))?;
 
         let status = response.status();

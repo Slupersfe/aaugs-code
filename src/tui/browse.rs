@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use super::palette::{BLUE, BORDER, GREEN, SUBTLE, YELLOW};
@@ -69,6 +69,7 @@ pub(super) fn draw_browse(frame: &mut Frame, app: &TuiApp) {
     let block = Block::default()
         .title(" Model Browser ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(YELLOW));
     let browse = Paragraph::new(text)
         .block(block)

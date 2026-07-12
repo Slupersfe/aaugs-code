@@ -2,203 +2,174 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use reqwest::Client;
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{
-    LLMError, LLMEvent, LLMProvider, Message, ToolDef, read_sse_stream,
+    LLMError, LLMEvent, LLMProvider, Message, ToolDef,
     ContentBlock, Role,
 };
 use crate::config::ProviderConfig;
 
-const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+use gemini_rust::{
+    ClientError, Content, FunctionCall, FunctionDeclaration,
+    FunctionResponse, Gemini, Part, Tool, FinishReason,
+};
+
+fn convert_error(e: ClientError) -> LLMError {
+    match e {
+        ClientError::BadResponse { code, description } => {
+            let status = reqwest::StatusCode::from_u16(code)
+                .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
+            LLMError::Http { status, body: description.unwrap_or_default() }
+        }
+        ClientError::PerformRequest { source, .. }
+        | ClientError::PerformRequestNew { source }
+        | ClientError::DecodeResponse { source } => LLMError::Network(source),
+        ClientError::Deserialize { source } => LLMError::Serde(source),
+        ClientError::InvalidApiKey { .. }
+        | ClientError::ConstructUrl { .. }
+        | ClientError::UrlParse { .. }
+        | ClientError::InvalidResourceName { .. } => LLMError::Config(e.to_string()),
+        ClientError::OperationTimeout { name } => LLMError::Stream(format!("request timed out: {name}")),
+        ClientError::MissingResponseHeader { header } => LLMError::Stream(format!("missing response header: {header}")),
+        ClientError::BadPart { source } => LLMError::Stream(format!("SSE parse error: {source}")),
+        ClientError::Io { source } => LLMError::Stream(format!("I/O error: {source}")),
+        ClientError::OperationFailed { name, code, message } => {
+            let status = reqwest::StatusCode::from_u16(code as u16)
+                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+            LLMError::Http { status, body: format!("{name}: {message}") }
+        }
+    }
+}
 
 pub struct GeminiProvider {
-    client: Client,
-    api_key: String,
+    client: Gemini,
     model: String,
-    base_url: String,
     max_tokens: u32,
     temperature: f32,
     provider_name: String,
 }
 
-#[derive(Serialize)]
-struct GeminiRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system_instruction: Option<SystemInstruction>,
-    contents: Vec<GeminiContent>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<GeminiTool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    generation_config: Option<GenerationConfig>,
-}
-
-#[derive(Serialize)]
-struct GenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-}
-
-#[derive(Serialize)]
-struct SystemInstruction {
-    parts: Vec<Part>,
-}
-
-#[derive(Serialize)]
-struct GeminiContent {
-    role: String,
-    parts: Vec<Part>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum Part {
-    Text { text: String },
-    FunctionCall { function_call: FunctionCall },
-    FunctionResponse { function_response: FunctionResponse },
-}
-
-#[derive(Serialize)]
-struct FunctionCall {
-    name: String,
-    args: Value,
-}
-
-#[derive(Serialize)]
-struct FunctionResponse {
-    name: String,
-    response: Value,
-}
-
-#[derive(Serialize)]
-struct GeminiTool {
-    function_declarations: Vec<GeminiFunctionDeclaration>,
-}
-
-#[derive(Serialize)]
-struct GeminiFunctionDeclaration {
-    name: String,
-    description: String,
-    parameters: Value,
-}
-
 impl GeminiProvider {
-    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Self {
-        Self {
-            client: Client::new(),
-            api_key: cfg.api_key.clone(),
-            model: cfg.model.clone(),
-            base_url: cfg.base_url.clone().unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+    pub fn new(cfg: &ProviderConfig, max_tokens: u32, temperature: f32, provider_name: &str) -> Result<Self, LLMError> {
+        let model = if cfg.model.starts_with("models/") {
+            cfg.model.clone()
+        } else {
+            format!("models/{}", cfg.model)
+        };
+
+        let client = match &cfg.base_url {
+            Some(base_url_str) => {
+                let base_url = url::Url::parse(base_url_str)
+                    .map_err(|e| LLMError::Config(format!("invalid Gemini base URL: {e}")))?;
+                Gemini::with_model_and_base_url(&cfg.api_key, model.clone(), base_url)
+                    .map_err(|e| LLMError::Config(format!("failed to create Gemini client: {e}")))?
+            }
+            None => {
+                Gemini::with_model(&cfg.api_key, model.clone())
+                    .map_err(|e| LLMError::Config(format!("failed to create Gemini client: {e}")))?
+            }
+        };
+
+        Ok(Self {
+            client,
+            model,
             max_tokens,
             temperature,
             provider_name: provider_name.to_string(),
-        }
+        })
     }
 
-    fn model_path(&self) -> String {
-        let model = if self.model.contains('/') {
-            self.model.split('/').next_back().unwrap_or(&self.model)
-        } else {
-            &self.model
-        };
-        format!("models/{}", model)
-    }
-
-    fn base_url(&self) -> String {
-        self.base_url.trim_end_matches('/').to_string()
-    }
-
-    fn convert_messages(&self, messages: &[Message]) -> (Option<SystemInstruction>, Vec<GeminiContent>) {
-        let mut system: Option<SystemInstruction> = None;
-        let mut contents = Vec::new();
+    fn convert_messages(&self, messages: &[Message]) -> (Option<String>, Vec<Content>) {
+        let mut system: Option<String> = None;
+        let mut contents: Vec<Content> = Vec::new();
         let mut tool_name_for_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        for msg in messages {
+            if msg.role == Role::Assistant {
+                for block in &msg.content {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
+                        tool_name_for_id.entry(id.clone()).or_insert_with(|| name.clone());
+                    }
+                }
+            }
+        }
 
         for msg in messages {
             match msg.role {
                 Role::System => {
                     let text = msg.content.iter()
                         .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b { Some(text.clone()) }
-                            else { None }
+                            if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    system = Some(SystemInstruction {
-                        parts: vec![Part::Text { text }],
-                    });
+                    system = Some(text);
                 }
                 Role::User => {
                     let parts: Vec<Part> = msg.content.iter().map(|block| {
                         match block {
-                            ContentBlock::Text { text } => Part::Text { text: text.clone() },
-                            _ => Part::Text { text: String::new() },
+                            ContentBlock::Text { text } => Part::Text {
+                                text: text.clone(),
+                                thought: None,
+                                thought_signature: None,
+                            },
+                            _ => Part::Text {
+                                text: String::new(),
+                                thought: None,
+                                thought_signature: None,
+                            },
                         }
                     }).collect();
-                    contents.push(GeminiContent {
-                        role: "user".to_string(),
-                        parts,
-                    });
+                    contents.push(
+                        Content { parts: Some(parts), role: None }
+                            .with_role(gemini_rust::Role::User)
+                    );
                 }
                 Role::Assistant => {
-                    let parts: Vec<Part> = msg.content.iter().filter_map(|block| {
+                    let mut parts: Vec<Part> = Vec::new();
+                    for block in &msg.content {
                         match block {
-                            ContentBlock::Text { text } => {
-                                if text.is_empty() { None }
-                                else { Some(Part::Text { text: text.clone() }) }
+                            ContentBlock::Text { text } if !text.is_empty() => {
+                                parts.push(Part::Text {
+                                    text: text.clone(),
+                                    thought: None,
+                                    thought_signature: None,
+                                });
                             }
                             ContentBlock::ToolUse { id: _, name, input } => {
-                                Some(Part::FunctionCall {
-                                    function_call: FunctionCall {
-                                        name: name.clone(),
-                                        args: input.clone(),
-                                    },
-                                })
+                                parts.push(Part::FunctionCall {
+                                    function_call: FunctionCall::new(name.clone(), input.clone()),
+                                    thought_signature: None,
+                                });
                             }
-                            _ => None,
+                            _ => {}
                         }
-                    }).collect();
-
+                    }
                     if !parts.is_empty() {
-                        contents.push(GeminiContent {
-                            role: "model".to_string(),
-                            parts,
-                        });
+                        contents.push(
+                            Content { parts: Some(parts), role: None }
+                                .with_role(gemini_rust::Role::Model)
+                        );
                     }
                 }
                 Role::Tool => {
-                    // Build mapping from tool_use_id -> name by scanning assistant messages first
-                    for m in messages {
-                        if m.role == Role::Assistant {
-                            for block in &m.content {
-                                if let ContentBlock::ToolUse { id, name, .. } = block {
-                                    tool_name_for_id.entry(id.clone()).or_insert_with(|| name.clone());
-                                }
-                            }
-                        }
-                    }
-                    let parts: Vec<Part> = msg.content.iter().filter_map(|block| {
+                    let mut parts: Vec<Part> = Vec::new();
+                    for block in &msg.content {
                         if let ContentBlock::ToolResult { tool_use_id, content } = block {
                             let name = tool_name_for_id.get(tool_use_id)
                                 .cloned()
                                 .unwrap_or_else(|| "unknown".to_string());
-                            Some(Part::FunctionResponse {
-                                function_response: FunctionResponse {
-                                    name,
-                                    response: json!({"result": content}),
-                                },
-                            })
-                        } else { None }
-                    }).collect();
-
+                            parts.push(Part::FunctionResponse {
+                                function_response: FunctionResponse::new(name, serde_json::json!({"result": content})),
+                            });
+                        }
+                    }
                     if !parts.is_empty() {
-                        contents.push(GeminiContent {
-                            role: "function".to_string(),
-                            parts,
-                        });
+                        contents.push(
+                            Content { parts: Some(parts), role: None }
+                                .with_role(gemini_rust::Role::User)
+                        );
                     }
                 }
             }
@@ -207,17 +178,20 @@ impl GeminiProvider {
         (system, contents)
     }
 
-    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<GeminiTool> {
+    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<Tool> {
         if tools.is_empty() {
             return Vec::new();
         }
-        vec![GeminiTool {
-            function_declarations: tools.iter().map(|t| GeminiFunctionDeclaration {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone(),
-            }).collect(),
-        }]
+
+        let declarations: Vec<FunctionDeclaration> = tools.iter().map(|t| {
+            let mut decl = FunctionDeclaration::new(&t.name, &t.description, None);
+            if t.input_schema != Value::Null {
+                decl = decl.with_parameters_value(t.input_schema.clone());
+            }
+            decl
+        }).collect();
+
+        vec![Tool::with_functions(declarations)]
     }
 }
 
@@ -235,65 +209,46 @@ impl LLMProvider for GeminiProvider {
         self.model = model.to_string();
     }
 
+    #[allow(deprecated)]
+    #[tracing::instrument(skip(self, messages, tools))]
     async fn stream_chat(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LLMEvent, LLMError>> + Send>>, LLMError> {
-        let (system, contents) = self.convert_messages(messages);
+        let (system_text, contents) = self.convert_messages(messages);
         let api_tools = self.convert_tools(tools);
 
-        let body = GeminiRequest {
-            system_instruction: system,
-            contents,
-            tools: api_tools,
-            generation_config: Some(GenerationConfig {
-                max_output_tokens: Some(self.max_tokens),
-                temperature: Some(self.temperature),
-            }),
-        };
+        let mut builder = self.client.generate_content()
+            .with_temperature(self.temperature)
+            .with_max_output_tokens(self.max_tokens as i32);
 
-        let url = format!(
-            "{}/{}:streamGenerateContent?key={}&alt=sse",
-            self.base_url(),
-            self.model_path(),
-            self.api_key
-        );
-
-        let response = self.client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LLMError::Http { status, body });
+        if let Some(text) = system_text {
+            builder = builder.with_system_instruction(text);
         }
 
-        use tokio::sync::mpsc;
+        for tool in api_tools {
+            builder = builder.with_tool(tool);
+        }
 
+        builder.contents = contents;
+
+        let stream = builder.execute_stream().await.map_err(convert_error)?;
+
+        use tokio::sync::mpsc;
         let (tx, rx) = mpsc::unbounded_channel::<Result<LLMEvent, LLMError>>();
-        let mut sse_stream = read_sse_stream(response).await?;
 
         tokio::spawn(async move {
-            while let Some(event_result) = sse_stream.next().await {
-                match event_result {
-                    Ok(sse) => {
-                        let parsed: Value = match serde_json::from_str(&sse.data) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        // Extract usage metadata (top-level in Gemini)
-                        if let Some(meta) = parsed.get("usageMetadata") {
-                            let prompt = meta.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            let completion = meta.get("candidatesTokenCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            let total = meta.get("totalTokenCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let mut stream = stream;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response) => {
+                        if let Some(usage) = &response.usage_metadata {
+                            let prompt = usage.prompt_token_count.unwrap_or(0) as u32;
+                            let completion = usage.candidates_token_count.unwrap_or(0) as u32;
+                            let total = usage.total_token_count.unwrap_or(0) as u32;
                             if total > 0 {
-                                let _ = tx.send(Ok(LLMEvent::Usage(crate::llm::Usage {
+                                let _ = tx.send(Ok(LLMEvent::Usage(super::Usage {
                                     prompt_tokens: prompt,
                                     completion_tokens: completion,
                                     total_tokens: total,
@@ -302,54 +257,32 @@ impl LLMProvider for GeminiProvider {
                             }
                         }
 
-                        let candidates = match parsed.get("candidates").and_then(|c| c.as_array()) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-
-                        for candidate in candidates {
-                            let content = match candidate.get("content") {
-                                Some(c) => c,
-                                None => continue,
-                            };
-
-                            let parts = match content.get("parts").and_then(|p| p.as_array()) {
-                                Some(p) => p,
-                                None => continue,
-                            };
-
-                            for part in parts {
-                                // Text part
-                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        let _ = tx.send(Ok(LLMEvent::Text(text.to_string())));
-                                    }
-                                }
-
-                                // Function call part
-                                if let Some(fc) = part.get("functionCall") {
-                                    if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
-                                        let args = fc.get("args").cloned().unwrap_or_else(|| {
-                                            tracing::warn!("missing 'args' in tool call response");
-                                            json!({})
-                                        });
-                                        let id = format!("fc_{}", uuid::Uuid::new_v4());
-                                        let _ = tx.send(Ok(LLMEvent::ToolCall {
-                                            id,
-                                            name: name.to_string(),
-                                            args,
-                                        }));
+                        for candidate in &response.candidates {
+                            if let Some(parts) = &candidate.content.parts {
+                                for part in parts {
+                                    match part {
+                                        Part::Text { text, .. } if !text.is_empty() => {
+                                            let _ = tx.send(Ok(LLMEvent::Text(text.clone())));
+                                        }
+                                        Part::FunctionCall { function_call, .. } => {
+                                            let id = format!("fc_{}", uuid::Uuid::new_v4());
+                                            let _ = tx.send(Ok(LLMEvent::ToolCall {
+                                                id,
+                                                name: function_call.name.clone(),
+                                                args: function_call.args.clone(),
+                                            }));
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
 
-                            // Finish reason
-                            if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
+                            if let Some(reason) = &candidate.finish_reason {
                                 let mapped = match reason {
-                                    "STOP" => "end_turn",
-                                    "MAX_TOKENS" => "max_tokens",
-                                    "SAFETY" => "safety",
-                                    _ => reason,
+                                    FinishReason::Stop => "end_turn",
+                                    FinishReason::MaxTokens => "max_tokens",
+                                    FinishReason::Safety => "safety",
+                                    _ => "other",
                                 };
                                 let _ = tx.send(Ok(LLMEvent::Stop {
                                     finish_reason: mapped.to_string(),
@@ -358,7 +291,7 @@ impl LLMProvider for GeminiProvider {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e));
+                        let _ = tx.send(Err(convert_error(e)));
                         break;
                     }
                 }
