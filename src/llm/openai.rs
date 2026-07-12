@@ -231,6 +231,27 @@ impl LLMProvider for OpenAIProvider {
             while let Some(chunk_result) = stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
+                    Err(async_openai::error::OpenAIError::JSONDeserialize(_, ref body))
+                        if body.contains("inference-cost") =>
+                    {
+                        if let Ok(val) = serde_json::from_str::<Value>(body) {
+                            let usage = val.get("normalizedUsage");
+                            let cost = val.get("cost").and_then(|c| c.as_str()).and_then(|c| c.parse::<f64>().ok()).unwrap_or(0.0);
+                            if let Some(u) = usage {
+                                let prompt = u.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let completion = u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                if prompt > 0 || completion > 0 {
+                                    let _ = tx.send(Ok(LLMEvent::Usage(crate::llm::Usage {
+                                        prompt_tokens: prompt,
+                                        completion_tokens: completion,
+                                        total_tokens: prompt + completion,
+                                        cost,
+                                    })));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         let _ = tx.send(Err(convert_error(e)));
                         break;
