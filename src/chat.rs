@@ -145,7 +145,7 @@ impl Session {
                     let display_name = if s.title.is_empty() {
                         s.id.clone()
                     } else {
-                        format!("{} ({})", s.title, &s.id[..8])
+                        s.title.clone()
                     };
                     // Truncate created_at to just the date portion
                     let created = if s.created_at.len() > 10 {
@@ -1050,6 +1050,29 @@ enum SlashResultTui {
     Continue,
 }
 
+fn messages_to_display_msgs(messages: &[Message]) -> Vec<crate::tui::DisplayMsg> {
+    messages.iter().filter_map(|msg| {
+        let role = match msg.role {
+            Role::System => "System",
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool",
+        };
+        let text = msg.content.iter().map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::ToolUse { name, input, .. } => {
+                format!("── {} ──\n{}", name, serde_json::to_string_pretty(input).unwrap_or_default())
+            }
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+        }).collect::<Vec<_>>().join("\n");
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(crate::tui::DisplayMsg { role: role.to_string(), text })
+        }
+    }).collect()
+}
+
 async fn handle_slash_command_tui(
     state: &mut ChatState,
     input: &str,
@@ -1298,8 +1321,9 @@ async fn handle_slash_command_tui(
                             }
                         }
                         state.model = loaded.model.clone();
+                        let msgs = messages_to_display_msgs(&loaded.messages);
                         state.session = loaded;
-                        let _ = event_tx.send(AppEvent::Clear);
+                        let _ = event_tx.send(AppEvent::RebuildMessages(msgs));
                         let _ = event_tx.send(AppEvent::ModelChanged(state.model.clone()));
                         let _ = event_tx.send(AppEvent::Info(format!("Resumed session: {}", state.session.title)));
                     }

@@ -41,6 +41,11 @@ pub fn init(model_dir: &Path) -> Result<()> {
         }
     }
 
+    // Suppress ONNX Runtime stdout logging (pollutes TUI display)
+    if let Ok(env) = ort::environment::current() {
+        env.set_log_level(ort::logging::LogLevel::Fatal);
+    }
+
     tracing::info!("loading ONNX router model from {}", model_dir.display());
 
     let session = ort::session::Session::builder()?

@@ -43,6 +43,7 @@ pub enum AppEvent {
     Clear,
     OpenBrowse,
     UpdateAvailable(u32),
+    RebuildMessages(Vec<DisplayMsg>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -598,6 +599,10 @@ fn handle_app_event(app: &mut TuiApp, event: AppEvent) {
         }
         AppEvent::Clear => {
             app.messages.clear();
+            app.scroll = 0;
+        }
+        AppEvent::RebuildMessages(msgs) => {
+            app.messages = msgs;
             app.scroll = 0;
         }
         AppEvent::OpenBrowse => {

@@ -60,8 +60,10 @@ async fn main() -> anyhow::Result<()> {
                     if sessions.is_empty() {
                         eprintln!("No saved sessions.");
                     } else {
+                        println!("{:<36}  {:<50}  {:<24}  {}", "Session ID", "Title", "Model", "Created");
+                        println!("{}", "-".repeat(140));
                         for (id, title, model, created) in &sessions {
-                            println!("{:<36}  {:<50}  {:<20}  {}", id, title, model, created);
+                            println!("{:<36}  {:<50}  {:<24}  {}", id, title, model, created);
                         }
                     }
                 }
